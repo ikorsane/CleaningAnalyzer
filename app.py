@@ -158,15 +158,18 @@ def build_outputs():
             # intended track and produce large cross-product heatmap artefacts.
             guide_mask=roi_mask(plate.shape,tuple(cfg['guides'][i]))
             accepted_clipped=cv2.bitwise_and(accepted,guide_mask)
-            accepted_masks.append(accepted_clipped)
+            # Use the scoring/analysis mask for heatmap geometry too. This removes
+            # pooled product and other non-soiled regions near the bottom of the plate
+            # that can be included in the broader contact-footprint proposal.
             am=cv2.bitwise_and(cv2.bitwise_and(accepted_clipped,soil),valid)
+            accepted_masks.append(am)
             pname=f"Product {chr(65+i)}"; row=metrics(pname,frac,am); row['Replicate']=ri; rows.append(row)
             stem=pname.replace(' ','_')
             files[f'{prefix}/{stem}_contact_mask.png']=png_bytes(accepted_clipped)
             files[f'{prefix}/{stem}_analysis_mask.png']=png_bytes(am)
             # Visual heatmap uses the intact contact footprint for geometry. No labels,
             # legends or red outlines are burned into the exported image.
-            files[f'{prefix}/{stem}_heatmap.png']=png_bytes(heatmap_plate_overlay(plate,frac,[accepted_clipped]))
+            files[f'{prefix}/{stem}_heatmap.png']=png_bytes(heatmap_plate_overlay(plate,frac,[am]))
         files[f'{prefix}/all_products_heatmap.png']=png_bytes(heatmap_plate_overlay(plate,frac,accepted_masks))
     df=pd.DataFrame(rows); df=df[['Replicate','Product']+[c for c in df.columns if c not in ('Replicate','Product')]]
     with tempfile.TemporaryDirectory() as td:
@@ -339,7 +342,7 @@ summary=df.groupby('Product',sort=False).agg(n=('Replicate','count'),mean_cleani
 summary['Rank']=summary['mean_cleaning'].rank(ascending=False,method='min').astype(int)
 
 st.subheader("Cleaning heatmaps")
-st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all product footprints together on the same rectified plate.")
+st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all products together on the same rectified plate. The coloured overlay is limited to the same valid, originally-soiled area used for scoring, so pooled product or background at the bottom is not shown as part of the heatmap.")
 for ri,name in enumerate(names,1):
     plate,dirty_model,frac,soil,valid=prepare_plate(st.session_state.exp['files'][name],st.session_state.exp['configured'][name])
     masks=[]
