@@ -382,7 +382,24 @@ st.bar_chart(coverage,y_label='Footprint meeting threshold (%)',height=360)
 
 
 st.subheader("Cleaning heatmaps")
-st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all products together on the same rectified plate. The heatmap follows each accepted contact footprint, The bottom 5% pooling band has already been physically cropped from the rectified plate before analysis.")
+st.caption("Each replicate shows the cleaning performance of all products on the same plate.")
+
+# Colour scale matching OpenCV COLORMAP_TURBO used in the heatmaps.
+scale_vals = np.linspace(0, 255, 512, dtype=np.uint8).reshape(1, -1)
+scale_bgr = cv2.applyColorMap(scale_vals, cv2.COLORMAP_TURBO)
+scale_rgb = cv2.cvtColor(scale_bgr, cv2.COLOR_BGR2RGB)
+fig_cb, ax_cb = plt.subplots(figsize=(9, 0.75))
+ax_cb.imshow(scale_rgb, aspect='auto', extent=[0, 100, 0, 1])
+ax_cb.set_yticks([])
+ax_cb.set_xlim(0, 100)
+ax_cb.set_xticks([0, 25, 50, 75, 100])
+ax_cb.set_xticklabels(['0%', '25%', '50%', '75%', '100%'])
+ax_cb.set_xlabel('Cleaning')
+for spine in ax_cb.spines.values():
+    spine.set_visible(False)
+fig_cb.tight_layout(pad=0.4)
+st.pyplot(fig_cb, use_container_width=True)
+plt.close(fig_cb)
 for ri,name in enumerate(names,1):
     plate,dirty_model,frac,soil,valid=prepare_plate(st.session_state.exp['files'][name],st.session_state.exp['configured'][name])
     masks=[]
