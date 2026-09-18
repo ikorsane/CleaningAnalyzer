@@ -32,7 +32,7 @@ def decode(upload):
 
 def pil_bgr(img): return Image.fromarray(cv2.cvtColor(img,cv2.COLOR_BGR2RGB))
 
-def display_fit(img,maxw=1050):
+def display_fit(img,maxw=800):
     h,w=img.shape[:2]; s=min(1.0,maxw/w); return cv2.resize(img,None,fx=s,fy=s,interpolation=cv2.INTER_AREA),s
 
 def _click_signature(v):
@@ -49,6 +49,7 @@ def collect_click(image, key, state_key, max_points=None):
         st.session_state[last_key]=sig
         if max_points is None or len(pts)<max_points:
             pts.append((float(v["x"]), float(v["y"])))
+            st.rerun()
     return pts
 
 def draw_points(img, pts, labels=None):
@@ -191,6 +192,7 @@ for ri,name in enumerate(names,1):
             if st.button(f"Save setup for replicate {ri}",key=f"save_{name}",type="primary"):
                 st.session_state.exp['configured'][name]={'corners':corners,'dirty':rects[0],'clean':rects[1],'guides':rects[2:]}
                 for i in range(int(n)): st.session_state.exp['accepted'].pop((name,i),None)
+                st.session_state['footprints_confirmed']=False
                 st.rerun()
 
 if len(st.session_state.exp['configured'])<len(names):
@@ -198,26 +200,31 @@ if len(st.session_state.exp['configured'])<len(names):
     st.stop()
 
 st.markdown('<div class="step">STEP 3 · FOOTPRINT VERIFICATION</div>',unsafe_allow_html=True)
-st.caption("The red outline is the automatic contact-footprint proposal. Accept it when correct; otherwise draw a manual polygon around the actual wetted/contacted track.")
+st.caption("The red outline is the automatic contact-footprint proposal. If it looks correct, leave it as-is. Only choose **Correct manually** when the proposal needs adjustment. Clicking **Continue to results** automatically accepts every unchanged proposal.")
 
+proposals={}
 for ri,name in enumerate(names,1):
     plate,dirty_model,frac,soil,valid=prepare_plate(st.session_state.exp['files'][name],st.session_state.exp['configured'][name])
     st.subheader(f"Replicate {ri}")
     cols=st.columns(2)
     for i,r in enumerate(st.session_state.exp['configured'][name]['guides']):
-        pname=f"Product {chr(65+i)}"; key=(name,i); proposal=propose_footprint(frac,tuple(r))
+        pname=f"Product {chr(65+i)}"; key=(name,i); proposal=propose_footprint(frac,tuple(r)); proposals[key]=proposal
         with cols[i%2]:
             st.markdown(f"**{pname}**")
-            if key not in st.session_state.exp['accepted']:
-                st.image(pil_bgr(mask_overlay(plate,proposal)),caption="Automatic proposal",use_container_width=True)
-                a,b=st.columns(2)
-                if a.button("Accept proposal",key=f'acc_{ri}_{i}',use_container_width=True):
-                    st.session_state.exp['accepted'][key]=proposal; st.rerun()
-                if b.button("Correct manually",key=f'corr_{ri}_{i}',use_container_width=True):
+            if key in st.session_state.exp['accepted']:
+                st.image(pil_bgr(mask_overlay(plate,st.session_state.exp['accepted'][key])),caption="Manually corrected footprint",use_container_width=True)
+                if st.button("Change manual correction",key=f'change_{ri}_{i}',use_container_width=True):
+                    st.session_state.exp['accepted'].pop(key,None)
                     st.session_state[f'manual_{ri}_{i}']=True
+                    st.rerun()
+            else:
+                st.image(pil_bgr(mask_overlay(plate,proposal)),caption="Automatic proposal — used unless corrected manually",use_container_width=True)
+                if st.button("Correct manually",key=f'corr_{ri}_{i}',use_container_width=True):
+                    st.session_state[f'manual_{ri}_{i}']=True
+                    st.rerun()
                 if st.session_state.get(f'manual_{ri}_{i}',False):
                     st.caption("Click around the actual footprint. Use at least 3 points, then press **Use manual footprint**.")
-                    pshow,ps=display_fit(plate,maxw=650)
+                    pshow,ps=display_fit(plate,maxw=600)
                     poly_state=f"poly_pts_{ri}_{i}"
                     poly_pts=st.session_state.setdefault(poly_state,[])
                     pvis=draw_points(pshow,poly_pts)
@@ -231,15 +238,18 @@ for ri,name in enumerate(names,1):
                         st.session_state[poly_state]=[]; st.session_state.pop(poly_state+"_last",None); st.rerun()
                     mm=polygon_mask(plate.shape,[(x/ps,y/ps) for x,y in poly_pts])
                     if len(poly_pts)>=3 and st.button("Use manual footprint",key=f'usepoly_{ri}_{i}',type="primary"):
-                        st.session_state.exp['accepted'][key]=mm; st.session_state[f'manual_{ri}_{i}']=False; st.rerun()
-            else:
-                st.image(pil_bgr(mask_overlay(plate,st.session_state.exp['accepted'][key])),caption="Accepted footprint",use_container_width=True)
-                if st.button("Change footprint",key=f'change_{ri}_{i}'):
-                    st.session_state.exp['accepted'].pop(key,None); st.rerun()
+                        st.session_state.exp['accepted'][key]=mm
+                        st.session_state[f'manual_{ri}_{i}']=False
+                        st.rerun()
 
-expected=len(names)*int(n)
-if len(st.session_state.exp['accepted'])<expected:
-    st.info(f"Verify all footprints to continue ({len(st.session_state.exp['accepted'])}/{expected}).")
+if not st.session_state.get('footprints_confirmed',False):
+    st.info("Automatic proposals do not need individual approval. Correct only the footprints that need it, then continue.")
+    if st.button("Continue to results",type="primary",use_container_width=True):
+        for key,proposal in proposals.items():
+            if key not in st.session_state.exp['accepted']:
+                st.session_state.exp['accepted'][key]=proposal
+        st.session_state['footprints_confirmed']=True
+        st.rerun()
     st.stop()
 
 st.markdown('<div class="step">STEP 4 · RESULTS</div>',unsafe_allow_html=True)
@@ -250,8 +260,25 @@ summary['Rank']=summary['mean_cleaning'].rank(ascending=False,method='min').asty
 st.subheader("Cleaning performance across replicate plates")
 st.dataframe(summary.rename(columns={'mean_cleaning':'Mean cleaning (%)','sd_cleaning':'SD (%)','coverage50':'Area ≥50% cleaned (%)','coverage75':'Area ≥75% cleaned (%)','footprint':'Mean footprint area (px)'}),hide_index=True,use_container_width=True,column_config={'Mean cleaning (%)':st.column_config.NumberColumn(format='%.1f'),'SD (%)':st.column_config.NumberColumn(format='%.1f'),'Area ≥50% cleaned (%)':st.column_config.NumberColumn(format='%.1f'),'Area ≥75% cleaned (%)':st.column_config.NumberColumn(format='%.1f'),'Mean footprint area (px)':st.column_config.NumberColumn(format='%.0f')})
 
-chart=summary.set_index('Product')[['mean_cleaning']].rename(columns={'mean_cleaning':'Mean cleaning (%)'})
-st.bar_chart(chart,y_label='Cleaning (%)',height=360)
+import matplotlib.pyplot as plt
+
+fig,ax=plt.subplots(figsize=(9,4.8))
+x=np.arange(len(summary))
+means=summary['mean_cleaning'].to_numpy(dtype=float)
+sds=summary['sd_cleaning'].fillna(0).to_numpy(dtype=float)
+labels=summary['Product'].astype(str).tolist()
+ax.bar(x,means,yerr=sds,capsize=6)
+ax.set_ylabel('Cleaning (%)')
+ax.set_ylim(0,100)
+ax.set_xticks(x)
+ax.set_xticklabels(labels)
+ax.set_title('Mean cleaning performance ± SD')
+ax.spines[['top','right']].set_visible(False)
+ax.grid(axis='y',alpha=.2)
+ax.set_axisbelow(True)
+fig.tight_layout()
+st.pyplot(fig,use_container_width=True)
+plt.close(fig)
 coverage=summary.set_index('Product')[['coverage50','coverage75']].rename(columns={'coverage50':'≥50% cleaned','coverage75':'≥75% cleaned'})
 st.bar_chart(coverage,y_label='Footprint meeting threshold (%)',height=360)
 
