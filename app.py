@@ -153,15 +153,20 @@ def build_outputs():
         accepted_masks=[]
         for i in range(exp['n_products']):
             key=(name,i); accepted=exp['accepted'][key]
-            accepted_masks.append(accepted)
-            am=cv2.bitwise_and(cv2.bitwise_and(accepted,soil),valid)
+            # Clip every accepted footprint to its own product-guide ROI.
+            # Automatic proposals/manual polygons can otherwise extend outside the
+            # intended track and produce large cross-product heatmap artefacts.
+            guide_mask=roi_mask(plate.shape,tuple(cfg['guides'][i]))
+            accepted_clipped=cv2.bitwise_and(accepted,guide_mask)
+            accepted_masks.append(accepted_clipped)
+            am=cv2.bitwise_and(cv2.bitwise_and(accepted_clipped,soil),valid)
             pname=f"Product {chr(65+i)}"; row=metrics(pname,frac,am); row['Replicate']=ri; rows.append(row)
             stem=pname.replace(' ','_')
-            files[f'{prefix}/{stem}_contact_mask.png']=png_bytes(accepted)
+            files[f'{prefix}/{stem}_contact_mask.png']=png_bytes(accepted_clipped)
             files[f'{prefix}/{stem}_analysis_mask.png']=png_bytes(am)
             # Visual heatmap uses the intact contact footprint for geometry. No labels,
             # legends or red outlines are burned into the exported image.
-            files[f'{prefix}/{stem}_heatmap.png']=png_bytes(heatmap_plate_overlay(plate,frac,[accepted]))
+            files[f'{prefix}/{stem}_heatmap.png']=png_bytes(heatmap_plate_overlay(plate,frac,[accepted_clipped]))
         files[f'{prefix}/all_products_heatmap.png']=png_bytes(heatmap_plate_overlay(plate,frac,accepted_masks))
     df=pd.DataFrame(rows); df=df[['Replicate','Product']+[c for c in df.columns if c not in ('Replicate','Product')]]
     with tempfile.TemporaryDirectory() as td:
@@ -337,7 +342,12 @@ st.subheader("Cleaning heatmaps")
 st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all product footprints together on the same rectified plate.")
 for ri,name in enumerate(names,1):
     plate,dirty_model,frac,soil,valid=prepare_plate(st.session_state.exp['files'][name],st.session_state.exp['configured'][name])
-    masks=[st.session_state.exp['accepted'][(name,i)] for i in range(st.session_state.exp['n_products'])]
+    masks=[]
+    cfg=st.session_state.exp['configured'][name]
+    for i in range(st.session_state.exp['n_products']):
+        accepted=st.session_state.exp['accepted'][(name,i)]
+        guide_mask=roi_mask(plate.shape,tuple(cfg['guides'][i]))
+        masks.append(cv2.bitwise_and(accepted,guide_mask))
     combined=heatmap_plate_overlay(plate,frac,masks)
     st.markdown(f"**Replicate {ri}**")
     st.image(pil_bgr(combined),use_container_width=True)
