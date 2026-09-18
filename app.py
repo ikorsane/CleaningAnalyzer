@@ -125,19 +125,32 @@ def heatmap_plate_overlay(plate, frac, footprint_masks, alpha=0.55):
         base=np.clip(base_f,0,255).astype(np.uint8)
     return base
 
+def crop_pooling_band(img, fraction=0.05):
+    """Physically remove the bottom pooling band from the rectified plate."""
+    h=img.shape[0]
+    keep=max(1,int(round(h*(1.0-fraction))))
+    return img[:keep].copy()
+
+def fit_mask_to_plate(mask, plate_shape):
+    """Keep masks compatible if the app reruns after introducing the physical crop."""
+    h,w=plate_shape[:2]
+    if mask.shape[:2]==(h,w): return mask
+    if mask.shape[1]==w and mask.shape[0]>=h: return mask[:h].copy()
+    return cv2.resize(mask,(w,h),interpolation=cv2.INTER_NEAREST)
+
 def png_bytes(img):
     ok,b=cv2.imencode('.png',img)
     if not ok: raise RuntimeError('Could not encode PNG')
     return b.tobytes()
 
 def prepare_plate(img, cfg):
-    plate=rectify(img,np.float32(cfg['corners'])); lab=lab_float(plate)
+    plate=crop_pooling_band(rectify(img,np.float32(cfg['corners']))); lab=lab_float(plate)
     dirty_m=roi_mask(plate.shape,tuple(cfg['dirty'])); clean_m=roi_mask(plate.shape,tuple(cfg['clean'])); clean_lab=robust_lab(lab,clean_m)
     excluded=clean_m.copy()
     for r in cfg['guides']: excluded=cv2.bitwise_or(excluded,roi_mask(plate.shape,tuple(r)))
     excluded[dirty_m>0]=0
     dirty_model=spatial_dirty_model(lab,excluded); frac=cleaning_fraction(lab,dirty_model,clean_lab)
-    soil=originally_soiled_mask(dirty_model,clean_lab); valid=bottom_exclusion_mask(plate.shape)
+    soil=originally_soiled_mask(dirty_model,clean_lab); valid=np.full(plate.shape[:2],255,np.uint8)
     return plate,dirty_model,frac,soil,valid
 
 def build_outputs():
@@ -152,7 +165,7 @@ def build_outputs():
         files[f'{prefix}/valid_plate_mask_bottom_excluded.png']=cv2.imencode('.png',valid)[1].tobytes()
         accepted_masks=[]
         for i in range(exp['n_products']):
-            key=(name,i); accepted=exp['accepted'][key]
+            key=(name,i); accepted=fit_mask_to_plate(exp['accepted'][key],plate.shape)
             # Clip every accepted footprint to its own product-guide ROI.
             # Automatic proposals/manual polygons can otherwise extend outside the
             # intended track and produce large cross-product heatmap artefacts.
@@ -190,7 +203,7 @@ with st.sidebar:
     st.header("Experiment")
     n=st.number_input("Number of product tracks",1,12,value=st.session_state.exp['n_products'],step=1)
     st.session_state.exp['n_products']=int(n)
-    st.info("The bottom 5% of the rectified plate is excluded from scoring because product can pool against the rack/stand.")
+    st.info("The bottom 5% of the rectified plate is cropped away immediately after corner correction because product can pool against the rack/stand.")
     if st.button("Reset experiment",use_container_width=True):
         
         for k in list(st.session_state.keys()):
@@ -236,7 +249,7 @@ for ri,name in enumerate(names,1):
             st.warning(f"Place exactly 4 corner points. Currently: {len(corners_disp)}")
             continue
         corners=[(x/s,y/s) for x,y in corners_disp]
-        plate=rectify(img,np.float32(corners)); pshow,ps=display_fit(plate)
+        plate=crop_pooling_band(rectify(img,np.float32(corners))); pshow,ps=display_fit(plate)
 
         need=2+int(n)
         labels=["Dirty control","Clean control"]+[f"Product {chr(65+i)}" for i in range(int(n))]
@@ -369,19 +382,18 @@ st.bar_chart(coverage,y_label='Footprint meeting threshold (%)',height=360)
 
 
 st.subheader("Cleaning heatmaps")
-st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all products together on the same rectified plate. The heatmap follows each accepted contact footprint, with only the straight bottom 5% pooling band excluded from display.")
+st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all products together on the same rectified plate. The heatmap follows each accepted contact footprint, The bottom 5% pooling band has already been physically cropped from the rectified plate before analysis.")
 for ri,name in enumerate(names,1):
     plate,dirty_model,frac,soil,valid=prepare_plate(st.session_state.exp['files'][name],st.session_state.exp['configured'][name])
     masks=[]
     cfg=st.session_state.exp['configured'][name]
     for i in range(st.session_state.exp['n_products']):
-        accepted=st.session_state.exp['accepted'][(name,i)]
+        accepted=fit_mask_to_plate(st.session_state.exp['accepted'][(name,i)],plate.shape)
         guide_mask=roi_mask(plate.shape,tuple(cfg['guides'][i]))
         accepted_clipped=cv2.bitwise_and(accepted,guide_mask)
-        # For display, exclude only the straight bottom pooling band. Do not apply the
-        # originally-soiled mask here; that mask has an irregular boundary and was what
-        # produced the curved/notched heatmap cutouts.
-        heatmap_mask=cv2.bitwise_and(accepted_clipped,valid)
+        # The pooling band was physically cropped before any ROIs or footprints were created.
+        # Therefore the heatmap needs no irregular bottom mask at all.
+        heatmap_mask=accepted_clipped
         masks.append(heatmap_mask)
     combined=heatmap_plate_overlay(plate,frac,masks)
     st.markdown(f"**Replicate {ri}**")
