@@ -32,7 +32,7 @@ def decode(upload):
 
 def pil_bgr(img): return Image.fromarray(cv2.cvtColor(img,cv2.COLOR_BGR2RGB))
 
-def display_fit(img,maxw=800):
+def display_fit(img,maxw=650):
     h,w=img.shape[:2]; s=min(1.0,maxw/w); return cv2.resize(img,None,fx=s,fy=s,interpolation=cv2.INTER_AREA),s
 
 def _click_signature(v):
@@ -40,16 +40,36 @@ def _click_signature(v):
     return (v.get("x"), v.get("y"), v.get("unix_time"))
 
 def collect_click(image, key, state_key, max_points=None):
-    """Display image and accumulate click coordinates across Streamlit reruns."""
+    """Display a clickable image and accumulate coordinates without forcing an extra rerun.
+
+    The component value from the previous click is processed *before* the widget is
+    rendered. This lets an annotated image be supplied on the same rerun while avoiding
+    the explicit st.rerun() loop that could make the component disappear.
+    """
     pts=st.session_state.setdefault(state_key, [])
-    v=streamlit_image_coordinates(image, key=key)
-    sig=_click_signature(v)
     last_key=state_key+"_last"
+
+    # Custom-component values are kept in session state under their widget key.
+    # Process that value first so the current click is available immediately on rerun.
+    prev=st.session_state.get(key)
+    sig=_click_signature(prev) if isinstance(prev,dict) else None
+    if sig and sig != st.session_state.get(last_key):
+        st.session_state[last_key]=sig
+        if max_points is None or len(pts)<max_points:
+            pts.append((float(prev["x"]), float(prev["y"])))
+
+    # Supplying an explicit width makes iframe sizing reliable on Streamlit Cloud.
+    width=getattr(image,"width",None)
+    v=streamlit_image_coordinates(image, key=key, width=width, cursor="crosshair")
+
+    # Fallback for component versions where the value is not exposed in session_state
+    # until after the component call. Do not force a rerun; the click itself already
+    # triggers Streamlit's normal rerun cycle.
+    sig=_click_signature(v)
     if sig and sig != st.session_state.get(last_key):
         st.session_state[last_key]=sig
         if max_points is None or len(pts)<max_points:
             pts.append((float(v["x"]), float(v["y"])))
-            st.rerun()
     return pts
 
 def draw_points(img, pts, labels=None):
@@ -153,8 +173,16 @@ for ri,name in enumerate(names,1):
         shown,s=display_fit(img)
         corner_state=f"corner_pts_{name}"
         corner_pts=st.session_state.setdefault(corner_state,[])
+        corner_widget=f"corners_{name}"
+        # Fold the most recent component click into state before drawing the overlay.
+        prev=st.session_state.get(corner_widget)
+        prev_sig=_click_signature(prev) if isinstance(prev,dict) else None
+        last_key=corner_state+"_last"
+        if prev_sig and prev_sig != st.session_state.get(last_key) and len(corner_pts)<4:
+            st.session_state[last_key]=prev_sig
+            corner_pts.append((float(prev["x"]),float(prev["y"])))
         corner_vis=draw_points(shown,corner_pts,["TL","TR","BR","BL"])
-        corners_disp=collect_click(pil_bgr(corner_vis),f"corners_{name}",corner_state,max_points=4)
+        corners_disp=collect_click(pil_bgr(corner_vis),corner_widget,corner_state,max_points=4)
         b1,b2=st.columns([1,3])
         if b1.button("Undo corner",key=f"undo_corner_{name}",disabled=not corners_disp):
             corners_disp.pop(); st.session_state.pop(corner_state+"_last",None); st.rerun()
@@ -175,9 +203,16 @@ for ri,name in enumerate(names,1):
             st.info(f"Now select: **{labels[current]}** ({current+1}/{need})")
             pair_state=f"rect_pair_{name}_{current}"
             pair=st.session_state.setdefault(pair_state,[])
+            pair_widget=f"rect_click_{name}_{current}"
+            prev=st.session_state.get(pair_widget)
+            prev_sig=_click_signature(prev) if isinstance(prev,dict) else None
+            last_key=pair_state+"_last"
+            if prev_sig and prev_sig != st.session_state.get(last_key) and len(pair)<2:
+                st.session_state[last_key]=prev_sig
+                pair.append((float(prev["x"]),float(prev["y"])))
             rect_vis=draw_rects(pshow,rects,labels)
             rect_vis=draw_points(rect_vis,pair,["1","2"])
-            pair=collect_click(pil_bgr(rect_vis),f"rect_click_{name}_{current}",pair_state,max_points=2)
+            pair=collect_click(pil_bgr(rect_vis),pair_widget,pair_state,max_points=2)
             if len(pair)==2:
                 rr=rect_from_two_points((pair[0][0]/ps,pair[0][1]/ps),(pair[1][0]/ps,pair[1][1]/ps))
                 rects.append(rr)
@@ -227,10 +262,17 @@ for ri,name in enumerate(names,1):
                     pshow,ps=display_fit(plate,maxw=600)
                     poly_state=f"poly_pts_{ri}_{i}"
                     poly_pts=st.session_state.setdefault(poly_state,[])
+                    poly_widget=f'poly_{ri}_{i}'
+                    prev=st.session_state.get(poly_widget)
+                    prev_sig=_click_signature(prev) if isinstance(prev,dict) else None
+                    last_key=poly_state+"_last"
+                    if prev_sig and prev_sig != st.session_state.get(last_key):
+                        st.session_state[last_key]=prev_sig
+                        poly_pts.append((float(prev["x"]),float(prev["y"])))
                     pvis=draw_points(pshow,poly_pts)
                     if len(poly_pts)>=2:
                         cv2.polylines(pvis,[np.array(poly_pts,np.int32)],False,(0,0,255),3)
-                    poly_pts=collect_click(pil_bgr(pvis),f'poly_{ri}_{i}',poly_state)
+                    poly_pts=collect_click(pil_bgr(pvis),poly_widget,poly_state)
                     pc1,pc2=st.columns(2)
                     if pc1.button("Undo point",key=f'undopoly_{ri}_{i}',disabled=not poly_pts):
                         poly_pts.pop(); st.session_state.pop(poly_state+"_last",None); st.rerun()
