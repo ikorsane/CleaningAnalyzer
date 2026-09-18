@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw
+import matplotlib.pyplot as plt
 from streamlit_image_coordinates import streamlit_image_coordinates
 from analysis_backend import (
     rectify, lab_float, roi_mask, robust_lab, spatial_dirty_model,
@@ -104,6 +105,31 @@ def polygon_mask(shape, pts):
 def mask_overlay(img,mask):
     out=img.copy(); cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE); cv2.drawContours(out,cnts,-1,(0,0,255),3); return out
 
+
+
+def heatmap_plate_overlay(plate, frac, footprint_masks, alpha=0.55):
+    """Create one unannotated heatmap image with all product footprints on the same plate.
+
+    The footprint geometry comes from the accepted/proposed contact masks, not the
+    fragmented analysis mask. This keeps the visible footprint shape intact.
+    """
+    base=plate.copy()
+    vals=np.clip(np.nan_to_num(frac,nan=0.0,posinf=1.0,neginf=0.0),0.0,1.0)
+    heat=cv2.applyColorMap(np.uint8(np.round(vals*255)),cv2.COLORMAP_TURBO)
+    union=np.zeros(plate.shape[:2],np.uint8)
+    for m in footprint_masks:
+        union=cv2.bitwise_or(union,(m>0).astype(np.uint8)*255)
+    idx=union>0
+    if np.any(idx):
+        blended=cv2.addWeighted(base,1-alpha,heat,alpha,0)
+        base[idx]=blended[idx]
+    return base
+
+def png_bytes(img):
+    ok,b=cv2.imencode('.png',img)
+    if not ok: raise RuntimeError('Could not encode PNG')
+    return b.tobytes()
+
 def prepare_plate(img, cfg):
     plate=rectify(img,np.float32(cfg['corners'])); lab=lab_float(plate)
     dirty_m=roi_mask(plate.shape,tuple(cfg['dirty'])); clean_m=roi_mask(plate.shape,tuple(cfg['clean'])); clean_lab=robust_lab(lab,clean_m)
@@ -124,14 +150,19 @@ def build_outputs():
         files[f'{prefix}/estimated_dirty_baseline.png']=cv2.imencode('.png',dirty_vis)[1].tobytes()
         files[f'{prefix}/estimated_original_soil_mask.png']=cv2.imencode('.png',soil)[1].tobytes()
         files[f'{prefix}/valid_plate_mask_bottom_excluded.png']=cv2.imencode('.png',valid)[1].tobytes()
+        accepted_masks=[]
         for i in range(exp['n_products']):
             key=(name,i); accepted=exp['accepted'][key]
+            accepted_masks.append(accepted)
             am=cv2.bitwise_and(cv2.bitwise_and(accepted,soil),valid)
             pname=f"Product {chr(65+i)}"; row=metrics(pname,frac,am); row['Replicate']=ri; rows.append(row)
             stem=pname.replace(' ','_')
-            files[f'{prefix}/{stem}_contact_mask.png']=cv2.imencode('.png',accepted)[1].tobytes()
-            files[f'{prefix}/{stem}_analysis_mask.png']=cv2.imencode('.png',am)[1].tobytes()
-            files[f'{prefix}/{stem}_footprint.png']=cv2.imencode('.png',heatmap_overlay(plate,frac,am,pname))[1].tobytes()
+            files[f'{prefix}/{stem}_contact_mask.png']=png_bytes(accepted)
+            files[f'{prefix}/{stem}_analysis_mask.png']=png_bytes(am)
+            # Visual heatmap uses the intact contact footprint for geometry. No labels,
+            # legends or red outlines are burned into the exported image.
+            files[f'{prefix}/{stem}_heatmap.png']=png_bytes(heatmap_plate_overlay(plate,frac,[accepted]))
+        files[f'{prefix}/all_products_heatmap.png']=png_bytes(heatmap_plate_overlay(plate,frac,accepted_masks))
     df=pd.DataFrame(rows); df=df[['Replicate','Product']+[c for c in df.columns if c not in ('Replicate','Product')]]
     with tempfile.TemporaryDirectory() as td:
         x=Path(td)/'results.xlsx'; save_report_workbook(df,x); xbytes=x.read_bytes()
@@ -302,10 +333,17 @@ df,xlsx,zipbytes=build_outputs()
 summary=df.groupby('Product',sort=False).agg(n=('Replicate','count'),mean_cleaning=('Mean cleaning depth (%)','mean'),sd_cleaning=('Mean cleaning depth (%)','std'),coverage50=('Footprint >=50% cleaned (%)','mean'),coverage75=('Footprint >=75% cleaned (%)','mean'),footprint=('Footprint area (px)','mean')).reset_index()
 summary['Rank']=summary['mean_cleaning'].rank(ascending=False,method='min').astype(int)
 
+st.subheader("Cleaning heatmaps")
+st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all product footprints together on the same rectified plate.")
+for ri,name in enumerate(names,1):
+    plate,dirty_model,frac,soil,valid=prepare_plate(st.session_state.exp['files'][name],st.session_state.exp['configured'][name])
+    masks=[st.session_state.exp['accepted'][(name,i)] for i in range(st.session_state.exp['n_products'])]
+    combined=heatmap_plate_overlay(plate,frac,masks)
+    st.markdown(f"**Replicate {ri}**")
+    st.image(pil_bgr(combined),use_container_width=True)
+
 st.subheader("Cleaning performance across replicate plates")
 st.dataframe(summary.rename(columns={'mean_cleaning':'Mean cleaning (%)','sd_cleaning':'SD (%)','coverage50':'Area ≥50% cleaned (%)','coverage75':'Area ≥75% cleaned (%)','footprint':'Mean footprint area (px)'}),hide_index=True,use_container_width=True,column_config={'Mean cleaning (%)':st.column_config.NumberColumn(format='%.1f'),'SD (%)':st.column_config.NumberColumn(format='%.1f'),'Area ≥50% cleaned (%)':st.column_config.NumberColumn(format='%.1f'),'Area ≥75% cleaned (%)':st.column_config.NumberColumn(format='%.1f'),'Mean footprint area (px)':st.column_config.NumberColumn(format='%.0f')})
-
-import matplotlib.pyplot as plt
 
 fig,ax=plt.subplots(figsize=(9,4.8))
 x=np.arange(len(summary))
