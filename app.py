@@ -85,12 +85,15 @@ def rect_from_two_points(a,b):
     x,y=min(x1,x2),min(y1,y2)
     return (int(x),int(y),max(1,int(abs(x2-x1))),max(1,int(abs(y2-y1))))
 
-def draw_rects(img, rects, labels=None):
+def draw_rects(img, rects, labels=None, scale=1.0):
+    """Draw stored full-resolution rectangles at the correct display scale."""
     out=img.copy()
     for i,(x,y,w,h) in enumerate(rects):
-        cv2.rectangle(out,(x,y),(x+w,y+h),(196,114,68),3)
+        dx=int(round(x*scale)); dy=int(round(y*scale))
+        dw=int(round(w*scale)); dh=int(round(h*scale))
+        cv2.rectangle(out,(dx,dy),(dx+dw,dy+dh),(196,114,68),3)
         if labels and i<len(labels):
-            cv2.putText(out,labels[i],(x+5,max(22,y+24)),cv2.FONT_HERSHEY_SIMPLEX,.7,(196,114,68),2,cv2.LINE_AA)
+            cv2.putText(out,labels[i],(dx+5,max(22,dy+24)),cv2.FONT_HERSHEY_SIMPLEX,.7,(196,114,68),2,cv2.LINE_AA)
     return out
 
 def polygon_mask(shape, pts):
@@ -210,7 +213,7 @@ for ri,name in enumerate(names,1):
             if prev_sig and prev_sig != st.session_state.get(last_key) and len(pair)<2:
                 st.session_state[last_key]=prev_sig
                 pair.append((float(prev["x"]),float(prev["y"])))
-            rect_vis=draw_rects(pshow,rects,labels)
+            rect_vis=draw_rects(pshow,rects,labels,scale=ps)
             rect_vis=draw_points(rect_vis,pair,["1","2"])
             pair=collect_click(pil_bgr(rect_vis),pair_widget,pair_state,max_points=2)
             if len(pair)==2:
@@ -218,7 +221,7 @@ for ri,name in enumerate(names,1):
                 rects.append(rr)
                 st.session_state.pop(pair_state,None); st.session_state.pop(pair_state+"_last",None); st.rerun()
         else:
-            st.image(pil_bgr(draw_rects(pshow,rects,labels)),caption="Selected controls and product guides",use_container_width=True)
+            st.image(pil_bgr(draw_rects(pshow,rects,labels,scale=ps)),caption="Selected controls and product guides",use_container_width=True)
         r1,r2=st.columns([1,3])
         if r1.button("Undo last area",key=f"undo_rect_{name}",disabled=not rects):
             rects.pop(); st.rerun()
