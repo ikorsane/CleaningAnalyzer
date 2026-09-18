@@ -182,7 +182,7 @@ for ri,name in enumerate(names,1):
                 rects.append(rr)
                 st.session_state.pop(pair_state,None); st.session_state.pop(pair_state+"_last",None); st.rerun()
         else:
-            st.image(pil_bgr(draw_rects(pshow,rects,labels)),caption="Selected controls and product guides",width="stretch")
+            st.image(pil_bgr(draw_rects(pshow,rects,labels)),caption="Selected controls and product guides",use_container_width=True)
         r1,r2=st.columns([1,3])
         if r1.button("Undo last area",key=f"undo_rect_{name}",disabled=not rects):
             rects.pop(); st.rerun()
