@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw
-from streamlit_drawable_canvas import st_canvas
+from streamlit_image_coordinates import streamlit_image_coordinates
 from analysis_backend import (
     rectify, lab_float, roi_mask, robust_lab, spatial_dirty_model,
     cleaning_fraction, originally_soiled_mask, propose_footprint,
@@ -35,39 +35,47 @@ def pil_bgr(img): return Image.fromarray(cv2.cvtColor(img,cv2.COLOR_BGR2RGB))
 def display_fit(img,maxw=1050):
     h,w=img.shape[:2]; s=min(1.0,maxw/w); return cv2.resize(img,None,fx=s,fy=s,interpolation=cv2.INTER_AREA),s
 
-def canvas_objects_to_rects(objs,scale):
-    out=[]
-    for o in objs or []:
-        if o.get('type')=='rect':
-            x=o.get('left',0)/scale; y=o.get('top',0)/scale
-            w=o.get('width',0)*o.get('scaleX',1)/scale; h=o.get('height',0)*o.get('scaleY',1)/scale
-            out.append((int(x),int(y),int(w),int(h)))
+def _click_signature(v):
+    if not v: return None
+    return (v.get("x"), v.get("y"), v.get("unix_time"))
+
+def collect_click(image, key, state_key, max_points=None):
+    """Display image and accumulate click coordinates across Streamlit reruns."""
+    pts=st.session_state.setdefault(state_key, [])
+    v=streamlit_image_coordinates(image, key=key)
+    sig=_click_signature(v)
+    last_key=state_key+"_last"
+    if sig and sig != st.session_state.get(last_key):
+        st.session_state[last_key]=sig
+        if max_points is None or len(pts)<max_points:
+            pts.append((float(v["x"]), float(v["y"])))
+    return pts
+
+def draw_points(img, pts, labels=None):
+    out=img.copy()
+    for i,(x,y) in enumerate(pts):
+        cv2.circle(out,(int(x),int(y)),8,(0,0,255),-1)
+        txt=(labels[i] if labels and i<len(labels) else str(i+1))
+        cv2.putText(out,txt,(int(x)+10,int(y)-8),cv2.FONT_HERSHEY_SIMPLEX,.7,(0,0,255),2,cv2.LINE_AA)
     return out
 
-def polygon_from_canvas(objs,shape,scale):
-    H,W=shape[:2]; m=np.zeros((H,W),np.uint8)
-    paths=[]
-    for o in objs or []:
-        if o.get('type')=='path' and o.get('path'):
-            pts=[]
-            for cmd in o['path']:
-                if len(cmd)>=3 and cmd[0] in ('M','L'):
-                    pts.append([cmd[1]/scale,cmd[2]/scale])
-            if len(pts)>=3: paths.append(np.array(pts,np.int32))
-        elif o.get('type')=='polygon' and o.get('points'):
-            left=o.get('left',0); top=o.get('top',0); sx=o.get('scaleX',1); sy=o.get('scaleY',1)
-            pts=np.array([[(left+p['x']*sx)/scale,(top+p['y']*sy)/scale] for p in o['points']],np.int32)
-            if len(pts)>=3: paths.append(pts)
-    if paths: cv2.fillPoly(m,paths,255)
-    return m
+def rect_from_two_points(a,b):
+    x1,y1=a; x2,y2=b
+    x,y=min(x1,x2),min(y1,y2)
+    return (int(x),int(y),max(1,int(abs(x2-x1))),max(1,int(abs(y2-y1))))
 
-def click_points_from_canvas(objs,scale):
-    pts=[]
-    for o in objs or []:
-        if o.get('type') in ('circle','ellipse'):
-            x=(o.get('left',0)+o.get('radius',5))/scale; y=(o.get('top',0)+o.get('radius',5))/scale
-            pts.append((x,y))
-    return pts
+def draw_rects(img, rects, labels=None):
+    out=img.copy()
+    for i,(x,y,w,h) in enumerate(rects):
+        cv2.rectangle(out,(x,y),(x+w,y+h),(196,114,68),3)
+        if labels and i<len(labels):
+            cv2.putText(out,labels[i],(x+5,max(22,y+24)),cv2.FONT_HERSHEY_SIMPLEX,.7,(196,114,68),2,cv2.LINE_AA)
+    return out
+
+def polygon_mask(shape, pts):
+    m=np.zeros(shape[:2],np.uint8)
+    if len(pts)>=3: cv2.fillPoly(m,[np.array(pts,np.int32)],255)
+    return m
 
 def mask_overlay(img,mask):
     out=img.copy(); cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE); cv2.drawContours(out,cnts,-1,(0,0,255),3); return out
@@ -118,6 +126,9 @@ with st.sidebar:
     st.session_state.exp['n_products']=int(n)
     st.info("The bottom 5% of the rectified plate is excluded from scoring because product can pool against the rack/stand.")
     if st.button("Reset experiment",use_container_width=True):
+        
+        for k in list(st.session_state.keys()):
+            if k != 'exp': del st.session_state[k]
         st.session_state.exp={'n_products':int(n),'files':{},'results':[],'configured':{},'accepted':{}}; st.rerun()
 
 st.markdown('<div class="step">STEP 1 · REPLICATES</div>',unsafe_allow_html=True)
@@ -137,23 +148,48 @@ st.caption("Configure each replicate. The same products must appear in the same 
 for ri,name in enumerate(names,1):
     img=st.session_state.exp['files'][name]
     with st.expander(f"Replicate {ri} — {name}",expanded=name not in st.session_state.exp['configured']):
-        st.markdown("**A. Plate corners** — choose *point* mode and place exactly four points: top-left, top-right, bottom-right, bottom-left.")
+        st.markdown("**A. Plate corners** — click the four corners in this order: **top-left, top-right, bottom-right, bottom-left**.")
         shown,s=display_fit(img)
-        c=st_canvas(fill_color='rgba(68,114,196,0.5)',stroke_width=2,stroke_color='#D62728',background_image=pil_bgr(shown),update_streamlit=True,height=shown.shape[0],width=shown.shape[1],drawing_mode='point',point_display_radius=6,key=f'corners_{name}')
-        corners=click_points_from_canvas((c.json_data or {}).get('objects',[]),s)
-        if len(corners)!=4:
-            st.warning(f"Place exactly 4 corner points. Currently: {len(corners)}")
+        corner_state=f"corner_pts_{name}"
+        corner_pts=st.session_state.setdefault(corner_state,[])
+        corner_vis=draw_points(shown,corner_pts,["TL","TR","BR","BL"])
+        corners_disp=collect_click(pil_bgr(corner_vis),f"corners_{name}",corner_state,max_points=4)
+        b1,b2=st.columns([1,3])
+        if b1.button("Undo corner",key=f"undo_corner_{name}",disabled=not corners_disp):
+            corners_disp.pop(); st.session_state.pop(corner_state+"_last",None); st.rerun()
+        b2.caption(f"Corner points: {len(corners_disp)} / 4")
+        if len(corners_disp)!=4:
+            st.warning(f"Place exactly 4 corner points. Currently: {len(corners_disp)}")
             continue
+        corners=[(x/s,y/s) for x,y in corners_disp]
         plate=rectify(img,np.float32(corners)); pshow,ps=display_fit(plate)
-        st.markdown(f"**B. Controls + {int(n)} product guides** — draw rectangles in this exact order: **dirty control, clean control, Product A, Product B…**")
-        rc=st_canvas(fill_color='rgba(68,114,196,0.12)',stroke_width=3,stroke_color='#4472C4',background_image=pil_bgr(pshow),update_streamlit=True,height=pshow.shape[0],width=pshow.shape[1],drawing_mode='rect',key=f'rois_{name}')
-        rects=canvas_objects_to_rects((rc.json_data or {}).get('objects',[]),ps)
+
         need=2+int(n)
-        st.caption(f"Rectangles: {len(rects)} / {need}")
+        labels=["Dirty control","Clean control"]+[f"Product {chr(65+i)}" for i in range(int(n))]
+        st.markdown(f"**B. Controls + {int(n)} product guides** — define each area below. For every area, click **two opposite corners** of the rectangle.")
+        rect_state=f"rects_{name}"
+        rects=st.session_state.setdefault(rect_state,[])
+        current=len(rects)
+        if current<need:
+            st.info(f"Now select: **{labels[current]}** ({current+1}/{need})")
+            pair_state=f"rect_pair_{name}_{current}"
+            pair=st.session_state.setdefault(pair_state,[])
+            rect_vis=draw_rects(pshow,rects,labels)
+            rect_vis=draw_points(rect_vis,pair,["1","2"])
+            pair=collect_click(pil_bgr(rect_vis),f"rect_click_{name}_{current}",pair_state,max_points=2)
+            if len(pair)==2:
+                rr=rect_from_two_points((pair[0][0]/ps,pair[0][1]/ps),(pair[1][0]/ps,pair[1][1]/ps))
+                rects.append(rr)
+                st.session_state.pop(pair_state,None); st.session_state.pop(pair_state+"_last",None); st.rerun()
+        else:
+            st.image(pil_bgr(draw_rects(pshow,rects,labels)),caption="Selected controls and product guides",width="stretch")
+        r1,r2=st.columns([1,3])
+        if r1.button("Undo last area",key=f"undo_rect_{name}",disabled=not rects):
+            rects.pop(); st.rerun()
+        r2.caption(f"Areas: {len(rects)} / {need}")
         if len(rects)==need:
-            if st.button(f"Save setup for replicate {ri}",key=f'save_{name}'):
+            if st.button(f"Save setup for replicate {ri}",key=f"save_{name}",type="primary"):
                 st.session_state.exp['configured'][name]={'corners':corners,'dirty':rects[0],'clean':rects[1],'guides':rects[2:]}
-                # invalidate previous accepted masks for this replicate
                 for i in range(int(n)): st.session_state.exp['accepted'].pop((name,i),None)
                 st.rerun()
 
@@ -180,11 +216,21 @@ for ri,name in enumerate(names,1):
                 if b.button("Correct manually",key=f'corr_{ri}_{i}',use_container_width=True):
                     st.session_state[f'manual_{ri}_{i}']=True
                 if st.session_state.get(f'manual_{ri}_{i}',False):
-                    st.caption("Use polygon mode: click around the actual footprint and double-click to close it.")
+                    st.caption("Click around the actual footprint. Use at least 3 points, then press **Use manual footprint**.")
                     pshow,ps=display_fit(plate,maxw=650)
-                    mc=st_canvas(fill_color='rgba(214,39,40,0.15)',stroke_width=3,stroke_color='#D62728',background_image=pil_bgr(pshow),update_streamlit=True,height=pshow.shape[0],width=pshow.shape[1],drawing_mode='polygon',key=f'poly_{ri}_{i}')
-                    mm=polygon_from_canvas((mc.json_data or {}).get('objects',[]),plate.shape,ps)
-                    if np.count_nonzero(mm)>0 and st.button("Use manual footprint",key=f'usepoly_{ri}_{i}'):
+                    poly_state=f"poly_pts_{ri}_{i}"
+                    poly_pts=st.session_state.setdefault(poly_state,[])
+                    pvis=draw_points(pshow,poly_pts)
+                    if len(poly_pts)>=2:
+                        cv2.polylines(pvis,[np.array(poly_pts,np.int32)],False,(0,0,255),3)
+                    poly_pts=collect_click(pil_bgr(pvis),f'poly_{ri}_{i}',poly_state)
+                    pc1,pc2=st.columns(2)
+                    if pc1.button("Undo point",key=f'undopoly_{ri}_{i}',disabled=not poly_pts):
+                        poly_pts.pop(); st.session_state.pop(poly_state+"_last",None); st.rerun()
+                    if pc2.button("Clear points",key=f'clearpoly_{ri}_{i}',disabled=not poly_pts):
+                        st.session_state[poly_state]=[]; st.session_state.pop(poly_state+"_last",None); st.rerun()
+                    mm=polygon_mask(plate.shape,[(x/ps,y/ps) for x,y in poly_pts])
+                    if len(poly_pts)>=3 and st.button("Use manual footprint",key=f'usepoly_{ri}_{i}',type="primary"):
                         st.session_state.exp['accepted'][key]=mm; st.session_state[f'manual_{ri}_{i}']=False; st.rerun()
             else:
                 st.image(pil_bgr(mask_overlay(plate,st.session_state.exp['accepted'][key])),caption="Accepted footprint",use_container_width=True)
