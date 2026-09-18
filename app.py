@@ -108,21 +108,21 @@ def mask_overlay(img,mask):
 
 
 def heatmap_plate_overlay(plate, frac, footprint_masks, alpha=0.55):
-    """Create one unannotated heatmap image with all product footprints on the same plate.
-
-    The footprint geometry comes from the accepted/proposed contact masks, not the
-    fragmented analysis mask. This keeps the visible footprint shape intact.
-    """
+    """Unannotated heatmap, coloured only inside the final analysis masks."""
     base=plate.copy()
     vals=np.clip(np.nan_to_num(frac,nan=0.0,posinf=1.0,neginf=0.0),0.0,1.0)
     heat=cv2.applyColorMap(np.uint8(np.round(vals*255)),cv2.COLORMAP_TURBO)
-    union=np.zeros(plate.shape[:2],np.uint8)
+
+    union=np.zeros(plate.shape[:2],dtype=bool)
     for m in footprint_masks:
-        union=cv2.bitwise_or(union,(m>0).astype(np.uint8)*255)
-    idx=union>0
-    if np.any(idx):
-        blended=cv2.addWeighted(base,1-alpha,heat,alpha,0)
-        base[idx]=blended[idx]
+        if m is not None:
+            union |= (m>0)
+
+    if np.any(union):
+        base_f=base.astype(np.float32)
+        heat_f=heat.astype(np.float32)
+        base_f[union]=(1.0-alpha)*base_f[union] + alpha*heat_f[union]
+        base=np.clip(base_f,0,255).astype(np.uint8)
     return base
 
 def png_bytes(img):
@@ -341,20 +341,6 @@ df,xlsx,zipbytes=build_outputs()
 summary=df.groupby('Product',sort=False).agg(n=('Replicate','count'),mean_cleaning=('Mean cleaning depth (%)','mean'),sd_cleaning=('Mean cleaning depth (%)','std'),coverage50=('Footprint >=50% cleaned (%)','mean'),coverage75=('Footprint >=75% cleaned (%)','mean'),footprint=('Footprint area (px)','mean')).reset_index()
 summary['Rank']=summary['mean_cleaning'].rank(ascending=False,method='min').astype(int)
 
-st.subheader("Cleaning heatmaps")
-st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all products together on the same rectified plate. The coloured overlay is limited to the same valid, originally-soiled area used for scoring, so pooled product or background at the bottom is not shown as part of the heatmap.")
-for ri,name in enumerate(names,1):
-    plate,dirty_model,frac,soil,valid=prepare_plate(st.session_state.exp['files'][name],st.session_state.exp['configured'][name])
-    masks=[]
-    cfg=st.session_state.exp['configured'][name]
-    for i in range(st.session_state.exp['n_products']):
-        accepted=st.session_state.exp['accepted'][(name,i)]
-        guide_mask=roi_mask(plate.shape,tuple(cfg['guides'][i]))
-        masks.append(cv2.bitwise_and(accepted,guide_mask))
-    combined=heatmap_plate_overlay(plate,frac,masks)
-    st.markdown(f"**Replicate {ri}**")
-    st.image(pil_bgr(combined),use_container_width=True)
-
 st.subheader("Cleaning performance across replicate plates")
 st.dataframe(summary.rename(columns={'mean_cleaning':'Mean cleaning (%)','sd_cleaning':'SD (%)','coverage50':'Area ≥50% cleaned (%)','coverage75':'Area ≥75% cleaned (%)','footprint':'Mean footprint area (px)'}),hide_index=True,use_container_width=True,column_config={'Mean cleaning (%)':st.column_config.NumberColumn(format='%.1f'),'SD (%)':st.column_config.NumberColumn(format='%.1f'),'Area ≥50% cleaned (%)':st.column_config.NumberColumn(format='%.1f'),'Area ≥75% cleaned (%)':st.column_config.NumberColumn(format='%.1f'),'Mean footprint area (px)':st.column_config.NumberColumn(format='%.0f')})
 
@@ -377,6 +363,23 @@ st.pyplot(fig,use_container_width=True)
 plt.close(fig)
 coverage=summary.set_index('Product')[['coverage50','coverage75']].rename(columns={'coverage50':'≥50% cleaned','coverage75':'≥75% cleaned'})
 st.bar_chart(coverage,y_label='Footprint meeting threshold (%)',height=360)
+
+
+st.subheader("Cleaning heatmaps")
+st.caption("Blue = low cleaning, red = high cleaning. Heatmaps are shown without labels or outlines burned into the image. Each replicate shows all products together on the same rectified plate. The coloured overlay is limited to the same valid, originally-soiled area used for scoring, so pooled product or background at the bottom is not shown as part of the heatmap.")
+for ri,name in enumerate(names,1):
+    plate,dirty_model,frac,soil,valid=prepare_plate(st.session_state.exp['files'][name],st.session_state.exp['configured'][name])
+    masks=[]
+    cfg=st.session_state.exp['configured'][name]
+    for i in range(st.session_state.exp['n_products']):
+        accepted=st.session_state.exp['accepted'][(name,i)]
+        guide_mask=roi_mask(plate.shape,tuple(cfg['guides'][i]))
+        accepted_clipped=cv2.bitwise_and(accepted,guide_mask)
+        analysis_mask=cv2.bitwise_and(cv2.bitwise_and(accepted_clipped,soil),valid)
+        masks.append(analysis_mask)
+    combined=heatmap_plate_overlay(plate,frac,masks)
+    st.markdown(f"**Replicate {ri}**")
+    st.image(pil_bgr(combined),use_container_width=True)
 
 c1,c2=st.columns(2)
 c1.download_button("Download Excel report",xlsx,file_name='Cleaning_Analyzer_results.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
