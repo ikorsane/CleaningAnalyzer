@@ -86,7 +86,7 @@ def originally_soiled_mask(dirty_model, clean_lab, clean_distance_fraction=0.45)
 # ------------------------- footprint proposal -------------------------
 
 # Used by Streamlit to invalidate old automatic masks after a detector update.
-FOOTPRINT_ALGORITHM_VERSION = "tip_anchored_edge_refined_20261008_v3"
+FOOTPRINT_ALGORITHM_VERSION = "tip_anchored_edge_refined_20261008_v4_bright_sides"
 
 import cv2
 import numpy as np
@@ -389,6 +389,75 @@ def _photo_refined_cap(img,mask,tip,guide):
     return out
 
 
+
+# ------------------- high-contrast track side refinement -------------------
+# Run only when the inside of a product track is uniformly far brighter than
+# the background (e.g. nearly fully cleaned product D). The algorithm searches
+# outward from the existing, geometrically stable footprint side and accepts
+# nearby white-to-dirty transitions, with a conservative displacement limit.
+# Otherwise return the original footprint completely unchanged. In particular,
+# never move the rounded tip selected by the user or let bright artefacts above
+# that point pull the mask upwards.
+
+def _refine_bright_track_sides(img,mask,tip,guide):
+    """Adjust side edges of bright, high-contrast tracks without changing user tip/cap."""
+    H,W=mask.shape
+    gx,gy,gw,gh=guide
+    tipx,tipy=tip
+    shoulder=min(H-2,int(round(tipy))+int(np.clip(.30*gw,18,90)))
+    if shoulder>=H-15:return mask
+    lum=cv2.GaussianBlur(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY).astype(np.float32),(0,0),2.0)
+    rows=np.arange(shoulder+6,H-7, max(2,int(.015*H)))
+    inside=[];outside=[]
+    for y in rows:
+        xx=np.flatnonzero(mask[y])
+        if xx.size<14:continue
+        a,b=int(xx[0]),int(xx[-1]);center=(a+b)//2; rad=(b-a)*.2
+        inside.extend(lum[y,max(a,int(center-rad)):min(b+1,int(center+rad)+1):max(1,int(rad//3))].tolist())
+        for l,r in ((max(int(gx),a-22),max(int(gx),a-8)),(min(int(gx+gw),b+8),min(int(gx+gw),b+22))):
+            if r>l:outside.extend(lum[y,l:r:4].tolist())
+    if not inside or not outside:return mask
+    inn=float(np.median(inside));out=float(np.median(outside))
+    # only high-contrast, near-white contact tracks. Leave less-cleaned tracks alone.
+    # Do not treat ordinary bright streaks (A) like a fully cleaned white track.
+    if inn < 185 or np.percentile(inside,10) < 175 or inn-out < 43:
+        return mask
+    thr=out+.58*(inn-out)
+    thr=np.clip(thr,138,210)
+    maxd=max(7,int(.105*gw))
+    L=[];R=[];qL=[];qR=[]
+    for y in range(shoulder,H):
+        xx=np.flatnonzero(mask[y]);
+        if len(xx)==0:return mask
+        l,r=int(xx[0]),int(xx[-1]);p=lum[y];
+        for side,base,vals,qual in ((-1,l,L,qL),(1,r,R,qR)):
+            lo=max(int(gx)+2,base-maxd);hi=min(int(gx+gw)-3,base+maxd)
+            crosses=[]
+            for z in range(lo+5,hi-5):
+                a=np.mean(p[z-5:z]);b=np.mean(p[z+1:z+6]);contrast=b-a if side<0 else a-b
+                if contrast>9 and ((side<0 and a<thr and b>thr) or (side>0 and a>thr and b<thr)):
+                    score=contrast - .30*abs(z-base)
+                    crosses.append((score,z,contrast))
+            if crosses:
+                _,best,contrast=max(crosses)
+                vals.append(float(best));qual.append(min(1.,max(0.,(contrast-8)/20)))
+            else:
+                vals.append(float(base));qual.append(0.)
+    n=len(L); baseL=np.array([np.flatnonzero(mask[y])[0] for y in range(shoulder,H)],float);baseR=np.array([np.flatnonzero(mask[y])[-1] for y in range(shoulder,H)],float)
+    def sm(x,s):return cv2.GaussianBlur(np.asarray(x,np.float32)[:,None],(1,0),sigmaY=s,sigmaX=0).ravel()
+    ql=sm(qL,6);qr=sm(qR,6)
+    cl=sm(L,4);cr=sm(R,4)
+    l=baseL+.85*ql*(cl-baseL);r=baseR+.85*qr*(cr-baseR)
+    l=sm(l,3);r=sm(r,3)
+    # fade correction in at cap/body junction
+    for k in range(min(14,n)):
+        a=k/14;l[k]=baseL[k]*(1-a)+l[k]*a;r[k]=baseR[k]*(1-a)+r[k]*a
+    outmask=mask.copy()
+    for j,y in enumerate(range(shoulder,H)):
+        a=max(int(gx),int(round(l[j])));b=min(int(gx+gw),int(round(r[j]))+1)
+        if b>a+4:outmask[y,:]=0;outmask[y,a:b]=255
+    return outmask
+
 def propose_footprint(clean_frac, guide_roi, plate_bgr=None, tip_xy=None):
     """Trace the contacted tongue downwards from its user-marked rounded top.
 
@@ -415,6 +484,7 @@ def propose_footprint(clean_frac, guide_roi, plate_bgr=None, tip_xy=None):
         refined=_photo_refined(small,small_tip,small_guide,mask)
         if refined is not None and np.any(refined):
             mask=_photo_refined_cap(small,refined,small_tip,small_guide)
+            mask=_refine_bright_track_sides(small,mask,small_tip,small_guide)
     if mask is None or not np.any(mask):
         # Safe fallback still has a rounded tip and stays in its own corridor.
         hs,ws=small.shape[:2]; gx,gy,gw,gh=small_guide; tx,ty=small_tip
