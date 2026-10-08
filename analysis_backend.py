@@ -155,89 +155,80 @@ def regularize_tongue(mask, guide):
     return out
 
 def propose_footprint(clean_frac, guide_roi):
+    """Estimate a continuous rounded track, without connected-component selection.
+
+    The guide fixes product identity and approximate horizontal position. Row-wise
+    boundaries are estimated across the whole height, then regularized so a weak
+    contrast region cannot delete the top or lower half of a track.
     """
-    Propose the contacted product track from a rough user guide.
+    H, W = clean_frac.shape
+    x, y, w, h = map(int, guide_roi)
+    if w < 5 or h < 8:
+        return roi_mask(clean_frac.shape, guide_roi)
+    cx = x + w / 2.0
+    # A guide is a rough bounding rectangle, not a footprint segmentation.
+    lo = max(0, int(x - .12*w)); hi = min(W, int(x + 1.12*w))
+    top = max(0, int(y - .25*h))
+    bottom = min(H, max(y+h, int(H-.015*H)))
+    if bottom <= top + 8 or hi <= lo + 5:
+        return roi_mask(clean_frac.shape, guide_roi)
 
-    Important: the guide is not a hard top/bottom crop, but it DOES define the
-    track's horizontal corridor.  This prevents an upward search for a rounded
-    tip from wandering into handwriting, plate edges, or neighbouring tracks.
-    """
-    x,y,w,h=guide_roi
-    H,W=clean_frac.shape
-
-    # Keep the search tightly tied to the product's horizontal position.
-    # Only a small side allowance is permitted; the useful extra search is
-    # mainly ABOVE the guide so a rounded tip cannot be clipped flat.
-    side=max(4,int(0.04*w))
-    top=max(12,int(0.22*h))
-    bottom=max(4,int(0.03*h))
-    x0=max(0,x-side); x1=min(W,x+w+side)
-    y0=max(0,y-top);  y1=min(H,y+h+bottom)
-    local=clean_frac[y0:y1,x0:x1]
-
-    seed=(local>0.08).astype(np.uint8)*255
-    seed=cv2.medianBlur(seed,5)
-
-    # Use only modest closing.  The previous large kernel could physically
-    # bridge the product tip to bright handwriting above it.
-    k=max(3,int(0.012*min(w,h))); k += 1-k%2
-    seed=cv2.morphologyEx(seed,cv2.MORPH_CLOSE,
-                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(k,k)),
-                         iterations=1)
-
-    n,labels,stats,cent=cv2.connectedComponentsWithStats(seed)
-    if n<=1:
-        m=np.zeros(clean_frac.shape,np.uint8)
-        m[y:y+h,x:x+w]=255
-        return m
-
-    # Pick the component with the strongest overlap with the ORIGINAL guide.
-    gx0=x-x0; gx1=gx0+w
-    gy0=y-y0; gy1=gy0+h
-    best=None; best_score=-1
-    for i in range(1,n):
-        comp=(labels==i)
-        overlap=np.count_nonzero(comp[gy0:gy1,gx0:gx1])
-        if overlap==0:
-            continue
-        area=stats[i,cv2.CC_STAT_AREA]
-        score=overlap + 0.005*area
-        if score>best_score:
-            best_score=score; best=i
-
-    if best is None:
-        m=np.zeros(clean_frac.shape,np.uint8)
-        m[y:y+h,x:x+w]=255
-        return m
-
-    localmask=(labels==best).astype(np.uint8)*255
-
-    # Reject implausible sideways excursions.  A product track may taper toward
-    # its tip, but it should not suddenly become much wider than the rough track.
-    centre=x + 0.5*w
-    max_half=0.60*w
-    corridor=np.zeros_like(localmask)
-    global_left=max(x0, int(centre-max_half))
-    global_right=min(x1, int(centre+max_half))
-    corridor[:, global_left-x0:global_right-x0]=255
-    localmask=cv2.bitwise_and(localmask,corridor)
-
-    # Keep only the connected piece that still overlaps the guide after the
-    # corridor restriction.  This removes detached lettering/edge fragments.
-    n2,lab2,stats2,_=cv2.connectedComponentsWithStats(localmask)
-    if n2>1:
-        best2=None; score2=-1
-        for i in range(1,n2):
-            comp=(lab2==i)
-            ov=np.count_nonzero(comp[gy0:gy1,gx0:gx1])
-            if ov>score2:
-                score2=ov; best2=i
-        if best2 is not None:
-            localmask=(lab2==best2).astype(np.uint8)*255
-
-    full=np.zeros(clean_frac.shape,np.uint8)
-    full[y0:y1,x0:x1]=localmask
-    return regularize_tongue(full,guide_roi)
+    # A continuous side envelope is more reliable than thresholded components.
+    # In each row find the broad high-cleaning band near the guide centre.
+    sm = cv2.GaussianBlur(clean_frac.astype(np.float32), (0, 0),
+                          sigmaX=max(2, .025*w), sigmaY=max(2, .012*h))
+    centers=[]; widths=[]; strengths=[]
+    search_x=np.arange(lo,hi)
+    for row in range(top,bottom):
+        v=sm[row,lo:hi]
+        # Limit lateral drift; do not allow a neighbour to win the search.
+        proximity=np.exp(-.5*((search_x-cx)/max(.38*w,1))**2)
+        weight=np.maximum(v-.025,0)*proximity
+        if weight.sum()>1e-6:
+            center=float((search_x*weight).sum()/weight.sum())
+        else:
+            center=cx
+        center=np.clip(center, cx-.13*w, cx+.13*w)
+        # Edge estimate uses a moderate threshold; noisy/missing rows fall back
+        # to the guide width rather than collapsing to a disconnected fragment.
+        threshold=max(.055, float(np.percentile(v,75))*.32)
+        candidate=np.where((v>=threshold)&(np.abs(search_x-center)<.60*w))[0]
+        if len(candidate)>4:
+            left=float(search_x[candidate[0]]); right=float(search_x[candidate[-1]])
+            width=right-left
+        else:
+            width=.88*w
+        centers.append(center); widths.append(width)
+        strengths.append(float(np.mean(v)))
+    centers=np.asarray(centers,np.float32)
+    widths=np.asarray(widths,np.float32)
+    # Establish stable body width from the guide and multiple rows, not a
+    # single selected component or the potentially noisy cap.
+    body_start=int(.25*len(widths)); body_end=max(body_start+1,int(.75*len(widths)))
+    typical=float(np.median(widths[body_start:body_end]))
+    typical=float(np.clip(typical,.72*w,1.08*w))
+    widths=np.clip(widths,.83*typical,1.13*typical)
+    sigma=max(3.,min(16.,.035*h))
+    def smooth(v):
+        return cv2.GaussianBlur(v[:,None],(1,0),sigmaX=0,sigmaY=sigma).ravel()
+    centers=smooth(centers)
+    widths=smooth(widths)
+    # Use the guide's upper edge as a conservative tip anchor, with limited
+    # adjustment toward an above-guide high-contrast band.
+    tip=max(top, y-int(.07*h))
+    cap=max(8,int(min(.22*h,.52*typical)))
+    out=np.zeros((H,W),np.uint8)
+    for row in range(tip,bottom):
+        i=row-top
+        if i<0 or i>=len(widths): continue
+        width=float(widths[i]); center=float(centers[i])
+        if row<tip+cap:
+            t=(row-tip+.5)/cap
+            width=typical*np.sqrt(max(0.,1.-(1.-t)**2))
+        left=max(lo,int(round(center-width/2)))
+        right=min(hi,int(round(center+width/2))+1)
+        if right>left: out[row,left:right]=255
+    return out
 
 
 # ------------------------- analysis -------------------------
