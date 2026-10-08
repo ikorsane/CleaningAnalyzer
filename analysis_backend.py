@@ -86,7 +86,7 @@ def originally_soiled_mask(dirty_model, clean_lab, clean_distance_fraction=0.45)
 # ------------------------- footprint proposal -------------------------
 
 # Used by Streamlit to invalidate old automatic masks after a detector update.
-FOOTPRINT_ALGORITHM_VERSION = "tip_anchored_ridge_tracker_20261008_v2"
+FOOTPRINT_ALGORITHM_VERSION = "tip_anchored_edge_refined_20261008_v3"
 
 import cv2
 import numpy as np
@@ -238,6 +238,157 @@ def follow_tongue(img, tip, guide):
     return mask
 
 
+
+# ---------------------- image-boundary refinement ----------------------
+# First build a continuous tongue using the existing top-point follower. Then
+# locally optimize each side toward vertically persistent bright rim evidence.
+# Uncertain rows interpolate back to that tongue, rather than chasing unrelated
+# white cleaning streaks. The cap is separately matched to the bright top edge.
+
+def _dp_refined_edge(evidence, base, leftlim, rightlim, tip_x, side, shoulder, gw):
+    H,W=evidence.shape
+    margin=int(max(8,.09*gw))
+    rows=np.arange(shoulder,H)
+    if len(rows)<4:return base
+    lo=max(leftlim+2,int(np.floor(np.min(base[rows])-margin)))
+    hi=min(rightlim-3,int(np.ceil(np.max(base[rows])+margin)))
+    if side<0: hi=min(hi,int(tip_x+5))
+    else:lo=max(lo,int(tip_x-5))
+    if hi-lo<6:return base
+    cols=np.arange(lo,hi+1)
+    n=len(cols)
+    # From original signal, use its vertical persistence to suppress horizontal markings.
+    scores=evidence[rows][:,cols]
+    # Contrast and local vertical persistence in natural BGR luminance units.
+    scores=np.minimum(scores,30)
+    costs=np.empty_like(scores,dtype=np.float32)
+    diff=cols[None,:]-base[rows,None]
+    costs[:]=1.1*scores - .030*diff*diff
+    # gradually clamp baseline at upper shoulder
+    cost0=costs[0]-.20*(cols-base[shoulder])**2
+    prev=np.zeros((len(rows),n),dtype=np.int16)
+    opts=np.arange(n)
+    best=cost0.copy()
+    for j in range(1,len(rows)):
+        win=np.full(n,-1e10,np.float32); parent=np.zeros(n,np.int16)
+        for delta in range(-3,4):
+            source=np.clip(opts+delta,0,n-1)
+            possible=best[source] - (.65*np.abs(delta)+.42*delta**2)
+            good=possible>win
+            win[good]=possible[good];parent[good]=source[good]
+        best=win+costs[j]
+        prev[j]=parent
+    ix=int(np.argmax(best))
+    path=np.empty(len(rows),np.float32)
+    for j in range(len(rows)-1,-1,-1):
+        path[j]=cols[ix];ix=prev[j,ix]
+    path=_sm(path,max(7,.055*gw))
+    # Blend in observations depending on local relative strength vs nearby alternatives
+    corrected=base.copy()
+    strength=evidence[rows,np.clip(np.rint(path).astype(int),0,W-1)]
+    reference=np.quantile(scores,.50,axis=1)
+    rel=strength-reference
+    conf=np.clip((rel-1.0)/7.,0,1)
+    conf=np.minimum(_sm(conf,12),.42)
+    corrected[rows]=base[rows]+np.clip(conf*(path-base[rows]),-8,8)
+    return corrected
+
+
+def _photo_refined(img,tip,guide,base):
+    if base is None:return None
+    H,W=base.shape;x,y,gw,gh=guide
+    tx,ty=tip
+    cap=int(np.clip(.30*gw,18,90)); shoulder=min(H-2,int(ty)+cap)
+    gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY).astype(np.float32)
+    fine=cv2.GaussianBlur(gray,(0,0),1.25)
+    long=cv2.GaussianBlur(fine,(0,0),max(6,.035*gw))
+    ridge=np.maximum(0,fine-long)
+    grad=cv2.Sobel(fine,cv2.CV_32F,1,0,ksize=3)
+    current=[]
+    for side in [-1,1]:
+        vals=np.empty(H,np.float32)
+        for j in range(H):
+            xx=np.flatnonzero(base[j]); vals[j] = (xx.min() if side==-1 else xx.max()) if xx.size else np.nan
+        vv=np.where(np.isfinite(vals))[0]
+        if vv.size<10: return base
+        vals=np.interp(np.arange(H),vv,vals[vv]).astype(np.float32)
+        # Positive ridge with directional contrast.
+        directed=np.maximum(0,-side*grad)
+        raw=np.clip(ridge+ .18*directed,0,30)
+        persistence=cv2.GaussianBlur(raw,(0,0),sigmaX=1.7,sigmaY=9)
+        evidence=(.48*raw+.52*persistence).astype(np.float32)
+        current.append(_dp_refined_edge(evidence,vals,max(0,int(x)),min(W,int(x+gw)),tx,side,shoulder,gw))
+    L,R=current
+    # combine and suppress sharp inward errors, modest natural narrowing allowed
+    width=np.maximum(2,R-L)
+    average=_sm(width,max(9,.06*gw))
+    width=np.maximum(width,.92*average)
+    width=_sm(width,max(6,.045*gw))
+    center=_sm((L+R)/2,max(7,.05*gw))
+    out=base.copy()
+    for j in range(shoulder,H):
+        out[j]=0
+        lo=max(int(x),int(round(center[j]-width[j]/2)))
+        hi=min(int(x+gw),int(round(center[j]+width[j]/2))+1)
+        if hi>lo:out[j,lo:hi]=255
+    return out
+
+
+def _photo_refined_cap(img,mask,tip,guide):
+    H,W=mask.shape
+    tx,ty=tip;x,y,gw,gh=guide
+    cap=int(np.clip(.30*gw,18,90));shoulder=min(H-2,int(ty)+cap)
+    candidate=mask[max(0,int(ty)-5):shoulder+2,:]
+    if not candidate.any():return mask
+    line=np.flatnonzero(mask[shoulder,:])
+    if len(line)<25:return mask
+    xl,xr=int(line[0]),int(line[-1])
+    coords=np.arange(xl,xr+1)
+    baseline=[]
+    for c in coords:
+        yy=np.flatnonzero(mask[:shoulder+3,c])
+        baseline.append(yy[0] if yy.size else shoulder)
+    baseline=np.asarray(baseline,np.float32)
+    smooth=cv2.GaussianBlur(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY).astype(np.float32),(0,0),1.3)
+    ridge=np.maximum(0,smooth-cv2.GaussianBlur(smooth,(0,0),9))
+    gy=cv2.Sobel(smooth,cv2.CV_32F,0,1,ksize=3)
+    ev=np.maximum(0,ridge+.17*np.maximum(gy,0))
+    persist=cv2.GaussianBlur(ev,(0,0),sigmaX=5,sigmaY=2.1)
+    ev=.65*ev+.35*persist
+    radius=max(8,min(19,int(.12*gw)))
+    ymin=max(0,int(np.floor(np.min(baseline)-radius)))
+    ymax=min(shoulder+radius,int(np.ceil(np.max(baseline)+radius)))
+    ry=np.arange(ymin,ymax+1)
+    prev=np.zeros((len(coords),len(ry)),np.int16)
+    init=ev[ry,coords[0]]-.05*(ry-baseline[0])**2
+    best=init.copy()
+    idx=np.arange(len(ry))
+    for j,c in enumerate(coords[1:],1):
+        win=np.full(len(ry),-1e9,dtype=np.float32); parent=np.zeros(len(ry),np.int16)
+        for shift in range(-3,4):
+            old=np.clip(idx+shift,0,len(idx)-1)
+            val=best[old]-(.50*np.abs(shift)+.35*shift*shift)
+            good=val>win;win[good]=val[good];parent[good]=old[good]
+        best=win+ev[ry,c]-.09*(ry-baseline[j])**2
+        prev[j]=parent
+    ix=int(np.argmax(best))
+    path=np.empty(len(coords),np.float32)
+    for j in range(len(coords)-1,-1,-1):
+        path[j]=ry[ix];ix=prev[j,ix]
+    path=_sm(path,3.4)
+    # confidence weighting reduces noise in weak top patches
+    conf=np.clip((ev[np.clip(np.round(path).astype(int),0,H-1),coords]-1)/10,0,1)
+    conf=_sm(conf,9)
+    path=.35*path+.65*baseline
+    path=(.2+.7*conf)*path+(.8-.7*conf)*baseline
+    out=mask.copy()
+    out[:shoulder+1,xl:xr+1]=0
+    for i,c in enumerate(coords):
+        yy=int(np.clip(round(path[i]),0,shoulder+1))
+        out[yy:shoulder+1,c]=255
+    return out
+
+
 def propose_footprint(clean_frac, guide_roi, plate_bgr=None, tip_xy=None):
     """Trace the contacted tongue downwards from its user-marked rounded top.
 
@@ -260,6 +411,10 @@ def propose_footprint(clean_frac, guide_roi, plate_bgr=None, tip_xy=None):
     small_guide=tuple(float(v)*scale for v in guide_roi)
     small_tip=tuple(float(v)*scale for v in tip_xy)
     mask=follow_tongue(small,small_tip,small_guide)
+    if mask is not None and np.any(mask):
+        refined=_photo_refined(small,small_tip,small_guide,mask)
+        if refined is not None and np.any(refined):
+            mask=_photo_refined_cap(small,refined,small_tip,small_guide)
     if mask is None or not np.any(mask):
         # Safe fallback still has a rounded tip and stays in its own corridor.
         hs,ws=small.shape[:2]; gx,gy,gw,gh=small_guide; tx,ty=small_tip
@@ -274,6 +429,10 @@ def propose_footprint(clean_frac, guide_roi, plate_bgr=None, tip_xy=None):
             if l<r:mask[iy,l:r]=255
     if scale<1.:
         mask=cv2.resize(mask,(W,H),interpolation=cv2.INTER_NEAREST)
+    for row in mask:
+        active=np.flatnonzero(row)
+        if active.size:
+            row[active[0]:active[-1]+1]=255
     return mask
 
 # ------------------------- analysis -------------------------
