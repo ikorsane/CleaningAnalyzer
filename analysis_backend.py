@@ -85,177 +85,196 @@ def originally_soiled_mask(dirty_model, clean_lab, clean_distance_fraction=0.45)
 
 # ------------------------- footprint proposal -------------------------
 
-# Changing this identifier causes the Streamlit app to refresh previously
-# calculated automatic footprints without removing plate/ROI selections.
-FOOTPRINT_ALGORITHM_VERSION = "photo_edges_20261008_v1"
+# Used by Streamlit to invalidate old automatic masks after a detector update.
+FOOTPRINT_ALGORITHM_VERSION = "tip_anchored_ridge_tracker_20261008_v2"
 
+import cv2
+import numpy as np
 
-def _smooth_trace(values, sigma):
-    """One-dimensional Gaussian smoothing without a scipy dependency."""
-    vector = np.asarray(values, dtype=np.float32).reshape(-1, 1)
-    if len(vector) < 2:
-        return vector.ravel()
-    return cv2.GaussianBlur(vector, (1, 0), sigmaX=0, sigmaY=max(0.5, sigma)).ravel()
+def _sm(v,sigma):
+    return cv2.GaussianBlur(np.asarray(v,np.float32).reshape(-1,1),(1,0),sigmaX=0,sigmaY=max(.5,sigma)).ravel()
 
-
-def _edge_guided_tongue(plate_bgr, guide):
-    """Trace both contact boundaries using photographic edge evidence.
-
-    Each edge follows the bright perimeter ridge, not the cleaned interior.
-    An approximately tongue-shaped contour is used as a soft constraint. This
-    continues the track through weakly visible/dirty regions and prevents the
-    old connected-component algorithm from selecting only its upper/lower part.
-    """
-    height, width = plate_bgr.shape[:2]
-    x, y, gw, gh = map(float, guide)
-    if gw < 12 or gh < 12:
-        return None
-    cx = x + gw / 2.0
-
-    gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.4)
-    # A bright, narrow outline is visible around even very poorly cleaned
-    # product tracks. The broad background is subtracted to expose the ridge.
-    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=max(7.0, 0.035 * gw))
-    ridge = np.maximum(gray - background, 0)
-    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
-    edge_score = cv2.GaussianBlur(ridge, (3, 3), 0.8)
-    edge_score += 0.20 * cv2.GaussianBlur(gx, (3, 3), 0.8)
-    edge_score = np.clip(edge_score, 0, 36)
-
-    # Locate the rounded cap near the top of the marked guide. Horizontal
-    # ridge evidence makes this work for dark interiors as well as white ones.
-    xa = max(0, int(cx - .20 * gw))
-    xb = min(width, int(cx + .20 * gw))
-    ya = max(5, int(y - .24 * gh))
-    yb = min(int(.55 * height), int(y + .19 * gh))
-    if xb <= xa + 3 or yb <= ya + 3:
-        return None
-    cap_scores = _smooth_trace(np.mean(ridge[ya:yb, xa:xb], axis=1), 4)
-    candidates_y = np.arange(ya, yb)
-    prior = np.exp(-.5 * ((candidates_y - y) / max(25., .17 * gh))**2)
-    tip = int(candidates_y[np.argmax(cap_scores * (.50 + .50 * prior))])
-    tip = max(0, min(tip, height - 8))
-
-    # The user guide defines the horizontal corridor. Restrict each traced
-    # side so strong dirt streaks or neighbouring track edges cannot take over.
-    left_limit = max(0, int(x - 0.045 * gw))
-    right_limit = min(width, int(x + 1.045 * gw))
-    if right_limit <= left_limit + 10:
-        return None
-    # A rounded cap widens into the normal track width over this distance.
-    cap_height = max(14, int(np.clip(.35 * gw, 25, 125)))
-    shoulder_height = max(cap_height, int(.80 * gw))
-
-    def predicted_width(row):
-        t = np.clip((row - tip + 1) / shoulder_height, 0, 1)
-        return max(.08, np.sqrt(max(0., 1. - (1. - t)**2))) * gw
-
-    paths = []
-    for side in (-1, 1):
-        lo = left_limit if side == -1 else max(left_limit, int(cx + .035 * gw))
-        hi = min(right_limit, int(cx - .035 * gw)) if side == -1 else right_limit
-        cols = np.arange(lo, hi, dtype=np.float32)
-        if len(cols) < 8:
-            return None
-        energies = []
-        for row in range(tip, height):
-            target = cx + side * predicted_width(row) / 2.
-            deviations = np.abs(cols - target) / gw
-            # Ridge is important, but not important enough to permit sudden
-            # jumps from the correct outline to a different product/droplet.
-            evidence = edge_score[row, lo:hi].copy()
-            evidence -= 18.0 * (deviations / .25)**2
-            energies.append(evidence)
-        energy = np.asarray(energies, dtype=np.float32)
-        row_count, nstates = energy.shape
-        value = energy[0].copy()
-        predecessor = np.zeros((row_count, nstates), dtype=np.int32)
-        state_ix = np.arange(nstates)
-        for ri in range(1, row_count):
-            best = np.full(nstates, -1.e9, dtype=np.float32)
-            back = np.zeros(nstates, dtype=np.int32)
-            for shift in range(-3, 4):
-                preceding = np.clip(state_ix + shift, 0, nstates - 1)
-                objective = value[preceding] - (1.2 * abs(shift) + .4 * shift**2)
-                improved = objective > best
-                best[improved] = objective[improved]
-                back[improved] = preceding[improved]
-            value = best + energy[ri]
-            predecessor[ri] = back
-        end_index = int(np.argmax(value))
-        path = np.empty(row_count, dtype=np.float32)
-        for ri in range(row_count - 1, -1, -1):
-            path[ri] = cols[end_index]
-            end_index = predecessor[ri, end_index]
-        paths.append(_smooth_trace(path, sigma=11))
-
-    left, right = paths
-    if np.median(right - left) < 4:
-        return None
-    trace_widths = np.maximum(right - left, 1.)
-    trace_centers = _smooth_trace((right + left) / 2., 12)
-    trace_widths = np.maximum(trace_widths, .88 * _smooth_trace(trace_widths, 23))
-    trace_widths = _smooth_trace(trace_widths, 12)
-    body = trace_widths[min(len(trace_widths)-1, cap_height):]
-    if len(body):
-        reference = float(np.median(body))
-        # Small bottom taper is permitted; gross inward notches are not.
-        trace_widths[cap_height:] = np.maximum(trace_widths[cap_height:], .80 * reference)
-        trace_widths = _smooth_trace(trace_widths, 8)
-
-    join = min(len(trace_widths)-1, cap_height)
-    left_join = max(0, join - 8)
-    right_join = min(len(trace_widths), join + 8)
-    joined_width = float(np.median(trace_widths[left_join:right_join]))
-    joined_center = float(np.median(trace_centers[left_join:right_join]))
-    out = np.zeros((height, width), dtype=np.uint8)
-    for relative_y, row in enumerate(range(tip, height)):
-        half_width = trace_widths[relative_y] / 2.
-        center = trace_centers[relative_y]
-        if relative_y < cap_height:
-            t = (relative_y + .5) / cap_height
-            # Rounded, broad cap (superellipse), not a triangular point.
-            cap_fraction = (1 - (1 - t)**3)**(1 / 3)
-            half_width = (joined_width / 2.) * cap_fraction
-            center = joined_center
-        xmin = max(left_limit, int(round(center - half_width)))
-        xmax = min(right_limit, int(round(center + half_width)) + 1)
-        if xmax > xmin:
-            out[row, xmin:xmax] = 255
+def lane_guides(tips, shape, plate_bgr=None):
+    H,W=shape[:2]
+    tips=[(float(px),float(py)) for px,py in tips]
+    xx=[p[0] for p in tips]
+    if len(xx)<1 or not all(a<b for a,b in zip(xx,xx[1:])):
+        raise ValueError('Product tops must be provided from left to right.')
+    if len(xx)==1:
+        borders=[0,W]
+    else:
+        borders=[max(0,xx[0]-.52*(xx[1]-xx[0]))]
+        image_gray=None
+        if plate_bgr is not None:
+            image_gray=cv2.cvtColor(plate_bgr,cv2.COLOR_BGR2GRAY).astype(np.float32)
+            image_gray=cv2.GaussianBlur(image_gray,(0,0),1.2)
+            ridge=np.maximum(image_gray-cv2.GaussianBlur(image_gray,(0,0),10),0)
+            dx=cv2.Sobel(image_gray,cv2.CV_32F,1,0,ksize=3)
+        for i in range(len(xx)-1):
+            a,b=xx[i],xx[i+1];gap=b-a;boundary=(a+b)*.5
+            if image_gray is not None and gap>=50:
+                probe_y=int(max(tips[i][1],tips[i+1][1])+.40*(H-max(tips[i][1],tips[i+1][1])))
+                ya=max(0,probe_y-12);yb=min(H,probe_y+13)
+                right_signal=np.mean((ridge+.24*np.maximum(0,-dx))[ya:yb],axis=0)
+                left_signal=np.mean((ridge+.24*np.maximum(0,dx))[ya:yb],axis=0)
+                def peak(sig,frac0,frac1):
+                    lo=max(0,int(a+frac0*gap));hi=min(W-1,int(a+frac1*gap))
+                    if hi<lo+5:return None,0
+                    loc=lo+int(np.argmax(sig[lo:hi+1]))
+                    return loc,float(sig[loc])
+                right,rs=peak(right_signal,.26,.55)
+                left,ls=peak(left_signal,.64,.94)
+                if (right is not None and left is not None and ls>14 and rs>12
+                        and right <= boundary + .05*gap and 7 < left-right < .35*gap):
+                    measured=(right+left)/2
+                    boundary=.85*measured+.15*boundary
+                    boundary=np.clip(boundary,a+.40*gap,a+.72*gap)
+            borders.append(boundary)
+        borders.append(min(W,xx[-1]+.52*(xx[-1]-xx[-2])))
+    out=[]
+    for i,(px,py) in enumerate(tips):
+        x0=max(0,int(np.floor(borders[i])));x1=min(W,int(np.ceil(borders[i+1])))
+        top=max(0,int(py-12))
+        out.append((x0,top,max(1,x1-x0),H-top))
     return out
 
+def follow_tongue(img, tip, guide):
+    H,W=img.shape[:2];tx,ty=map(float,tip); x,y,gw,gh=guide
+    left_bound=max(0,int(x));right_bound=min(W,int(x+gw))
+    if not(left_bound+5<tx<right_bound-5):return None
+    ytop=int(np.clip(round(ty),0,H-20))
+    gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY).astype(np.float32)
+    sm=cv2.GaussianBlur(gray,(0,0),1.2)
+    ridge=np.maximum(0,sm-cv2.GaussianBlur(sm,(0,0),max(7,.04*gw)))
+    signed_dx=cv2.Sobel(sm,cv2.CV_32F,1,0,ksize=3)
+    # Evidence is positive for a bright perimeter ridge or for the correct
+    # signed contrast transition at the left/right edge.
+    cap_h=int(np.clip(.30*gw,18,90))
+    shoulder=min(H-2,ytop+cap_h)
+    rows=np.arange(ytop,H)
+    edge_paths=[]
+    for side in (-1,1):
+        strength=ridge + .24*np.maximum(0,-side*signed_dx)
+        # Shoulder candidates constrained to the selected lane and a physically
+        # plausible distance from the manually marked rounded tip.
+        minsep=max(5.,.11*gw)
+        maxsep=min(.49*gw,(tx-left_bound-2 if side==-1 else right_bound-tx-2))
+        xc1=int(max(left_bound+2,tx-maxsep)) if side==-1 else int(tx+minsep)
+        xc2=int(tx-minsep) if side==-1 else int(min(right_bound-2,tx+maxsep))
+        if xc2<=xc1+3: return None
+        col=np.arange(xc1,xc2+1)
+        nearby=strength[max(0,shoulder-9):min(H,shoulder+10), :]
+        profile=np.mean(nearby[:,col],axis=0)
+        # Prevent a far plate edge/droplet from beating an actual boundary.
+        rough=tx+side*.28*gw
+        prior_penalty=3.*((col-rough)/(.30*gw))**2
+        col0=int(col[np.argmax(profile-prior_penalty)])
 
-def propose_footprint(clean_frac, guide_roi, plate_bgr=None):
-    """Suggest the complete product-contact tongue, including poorly cleaned soil.
+        # Trace downwards from the confident shoulder anchor. The tracker only
+        # searches close to its previous boundary: it cannot jump to the next
+        # product or to an isolated patch of high cleaning intensity.
+        path=np.empty(H-shoulder,np.float32)
+        pos=float(col0)
+        v=side*.14
+        confidence=np.empty(len(path),np.float32)
+        for j,row in enumerate(range(shoulder,H)):
+            forecast=np.clip(pos+v,left_bound+2,right_bound-3)
+            search=max(6,int(.055*gw))
+            lo=max(left_bound+2,int(forecast-search));hi=min(right_bound-2,int(forecast+search))
+            if lo>=hi:
+                path[j]=pos;confidence[j]=0;continue
+            cc=np.arange(lo,hi+1)
+            line=cv2.GaussianBlur(strength[max(row-1,0):min(row+2,H),:].mean(axis=0)[None,:],(5,1),0).ravel()
+            sc=line[cc]-.24*((cc-forecast)**2)
+            winner=int(cc[np.argmax(sc)])
+            peak=float(line[winner]);local_med=float(np.median(line[cc]))
+            credible=peak>max(4.5,local_med+1.5)
+            if credible:
+                shift=float(np.clip(winner-forecast,-2.4,2.4))
+                new=forecast+.40*shift
+                confidence[j]=min(1.,(peak-4.5)/10.)
+                # The predicted velocity learns slowly from credible edges.
+                v=np.clip(.90*v+.10*(new-pos),-.65,.65)
+            else:
+                # Weak evidence: continue smoothly based on the last observed
+                # trajectory rather than narrowing or finding another edge.
+                new=forecast
+                v=np.clip(.995*v + .005*side*.10,-.35,.35)
+                confidence[j]=0.
+            pos=float(np.clip(new,left_bound+2,right_bound-3))
+            path[j]=pos
+        # smooth high-frequency scanner noise; preserve large-scale contours
+        path=_sm(path,max(4,.035*gw))
+        # Gentle one-sided shape constraint: no substantial inward notches.
+        peak=path[0]
+        for j in range(1,len(path)):
+            if side<0:
+                peak=min(peak,path[j]);path[j]=min(path[j],peak+4.)
+            else:
+                peak=max(peak,path[j]);path[j]=max(path[j],peak-4.)
+        edge_paths.append((col0,path))
+    (left0,left),(right0,right)=edge_paths
+    if len(left)!=len(right): return None
+    left=np.clip(left,left_bound,right_bound)
+    right=np.clip(right,left_bound,right_bound)
+    bodycenter=_sm(.5*(left+right),max(5,.026*gw))
+    widths=np.maximum(right-left,5)
+    widths=_sm(widths,max(4,.026*gw))
+    mask=np.zeros((H,W),np.uint8)
+    # Elliptical rounding at the top: widest at shoulder, curved rather than flat.
+    ctr=float(.5*(left0+right0))
+    rad=float(.5*(right0-left0))
+    if rad<5:return None
+    for row in range(ytop,shoulder):
+        t=(row-ytop+.35)/max(1,shoulder-ytop)
+        half=rad*np.sqrt(max(0.,1.-(1.-t)**2))
+        c=ctr
+        l=max(left_bound,int(round(c-half)));r=min(right_bound,int(round(c+half))+1)
+        if l<r:mask[row,l:r]=255
+    for j,row in enumerate(range(shoulder,H)):
+        l=max(left_bound,int(round(bodycenter[j]-widths[j]/2)))
+        r=min(right_bound,int(round(bodycenter[j]+widths[j]/2))+1)
+        if l<r:mask[row,l:r]=255
+    return mask
 
-    The application should pass the *cropped rectified plate* as plate_bgr.
-    For backward compatibility the clean_fraction map can be used as a fallback,
-    but photographic boundary evidence is much more reliable.
+
+def propose_footprint(clean_frac, guide_roi, plate_bgr=None, tip_xy=None):
+    """Trace the contacted tongue downwards from its user-marked rounded top.
+
+    Use photographic rim contrast, not high cleaning fraction (dark interiors are
+    still contacted). When the rim weakens, propagate the smooth boundary.
     """
-    if plate_bgr is None:
-        # Older callers may not provide a photograph. Retain usable proposals.
-        v = np.clip(np.nan_to_num(clean_frac, nan=0), 0, 1)
-        plate_bgr = cv2.cvtColor(np.uint8(v * 255), cv2.COLOR_GRAY2BGR)
-    if plate_bgr.shape[:2] != clean_frac.shape[:2]:
-        raise ValueError('Photo and cleaning fraction dimensions must match.')
-    # Lower-resolution edge tracing keeps Streamlit reruns reasonably fast.
     H, W = clean_frac.shape[:2]
-    scale = min(1., 900. / W)
-    if scale < 1:
-        smaller = cv2.resize(plate_bgr, (round(W*scale), round(H*scale)),
-                             interpolation=cv2.INTER_AREA)
-        smaller_guide = tuple(float(v)*scale for v in guide_roi)
-    else:
-        smaller = plate_bgr
-        smaller_guide = tuple(float(v) for v in guide_roi)
-    result = _edge_guided_tongue(smaller, smaller_guide)
-    if result is None or not np.any(result):
-        result = roi_mask(smaller.shape, tuple(map(int, smaller_guide)))
-    if scale < 1:
-        result = cv2.resize(result, (W, H), interpolation=cv2.INTER_NEAREST)
-    return result
-
+    if plate_bgr is None:
+        val = np.uint8(255*np.clip(np.nan_to_num(clean_frac),0,1))
+        plate_bgr = cv2.cvtColor(val,cv2.COLOR_GRAY2BGR)
+    if plate_bgr.shape[:2] != (H,W):
+        raise ValueError('Plate and cleaning fraction must have identical dimensions')
+    x,y,w,h=guide_roi
+    if tip_xy is None:
+        tip_xy=(x+.5*w, y+12.)
+    scale=min(1.,900./max(W,1))
+    if scale<1.:
+        small=cv2.resize(plate_bgr,(max(2,round(W*scale)),max(2,round(H*scale))),interpolation=cv2.INTER_AREA)
+    else: small=plate_bgr
+    small_guide=tuple(float(v)*scale for v in guide_roi)
+    small_tip=tuple(float(v)*scale for v in tip_xy)
+    mask=follow_tongue(small,small_tip,small_guide)
+    if mask is None or not np.any(mask):
+        # Safe fallback still has a rounded tip and stays in its own corridor.
+        hs,ws=small.shape[:2]; gx,gy,gw,gh=small_guide; tx,ty=small_tip
+        mask=np.zeros((hs,ws),np.uint8)
+        cap=max(15,int(.29*gw))
+        left=max(0,int(gx));right=min(ws,int(gx+gw))
+        rad=max(5,min(.35*gw,tx-left,right-tx))
+        for iy in range(max(0,int(ty)),hs):
+            t=min(1.,(iy-ty+.35)/cap)
+            rr=rad*np.sqrt(max(0,1-(1-t)**2))
+            l=max(left,int(tx-rr));r=min(right,int(tx+rr)+1)
+            if l<r:mask[iy,l:r]=255
+    if scale<1.:
+        mask=cv2.resize(mask,(W,H),interpolation=cv2.INTER_NEAREST)
+    return mask
 
 # ------------------------- analysis -------------------------
 

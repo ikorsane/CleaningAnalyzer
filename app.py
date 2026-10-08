@@ -11,7 +11,7 @@ from analysis_backend import (
     rectify, lab_float, roi_mask, robust_lab, spatial_dirty_model,
     cleaning_fraction, originally_soiled_mask, propose_footprint,
     bottom_exclusion_mask, metrics, heatmap_overlay, save_report_workbook,
-    FOOTPRINT_ALGORITHM_VERSION,
+    FOOTPRINT_ALGORITHM_VERSION, lane_guides,
 )
 
 st.set_page_config(page_title="Cleaning Analyzer", page_icon="🧪", layout="wide")
@@ -30,7 +30,15 @@ if 'exp' not in st.session_state:
 # A new boundary algorithm invalidates previously cached automatic proposals.
 # Retain uploads and ROI selections so nobody has to mark plate corners again.
 if st.session_state.get('footprint_algorithm_version') != FOOTPRINT_ALGORITHM_VERSION:
-    st.session_state.exp['accepted'] = {}
+    exp = st.session_state.exp
+    for name, config in list(exp.get('configured', {}).items()):
+        if 'tips' not in config:
+            # Preserve already selected dirty/clean reference areas; only the
+            # product tops need selecting under the new workflow.
+            if 'dirty' in config and 'clean' in config:
+                st.session_state[f'controls_rects_{name}'] = [config['dirty'], config['clean']]
+            exp['configured'].pop(name, None)
+    exp['accepted'] = {}
     st.session_state['footprints_confirmed'] = False
     st.session_state['footprint_algorithm_version'] = FOOTPRINT_ALGORITHM_VERSION
 
@@ -155,7 +163,12 @@ def prepare_plate(img, cfg):
     plate=crop_pooling_band(rectify(img,np.float32(cfg['corners']))); lab=lab_float(plate)
     dirty_m=roi_mask(plate.shape,tuple(cfg['dirty'])); clean_m=roi_mask(plate.shape,tuple(cfg['clean'])); clean_lab=robust_lab(lab,clean_m)
     excluded=clean_m.copy()
-    for r in cfg['guides']: excluded=cv2.bitwise_or(excluded,roi_mask(plate.shape,tuple(r)))
+    for gx,gy,gw,gh in cfg['guides']:
+        # The generated guide is a broad horizontal corridor, not a contact mask.
+        # Keep a surrounding dirty-background margin for baseline estimation.
+        pad=max(2,int(.09*gw))
+        r=(gx+pad,gy,max(1,gw-2*pad),gh)
+        excluded=cv2.bitwise_or(excluded,roi_mask(plate.shape,r))
     excluded[dirty_m>0]=0
     dirty_model=spatial_dirty_model(lab,excluded); frac=cleaning_fraction(lab,dirty_model,clean_lab)
     soil=originally_soiled_mask(dirty_model,clean_lab); valid=np.full(plate.shape[:2],255,np.uint8)
@@ -251,7 +264,7 @@ for ri,name in enumerate(names,1):
         corners_disp=collect_click(pil_bgr(corner_vis),corner_widget,corner_state,max_points=4)
         b1,b2=st.columns([1,3])
         if b1.button("Undo corner",key=f"undo_corner_{name}",disabled=not corners_disp):
-            corners_disp.pop(); st.session_state.pop(corner_state+"_last",None); st.rerun()
+            corners_disp.pop(); st.rerun()
         b2.caption(f"Corner points: {len(corners_disp)} / 4")
         if len(corners_disp)!=4:
             st.warning(f"Place exactly 4 corner points. Currently: {len(corners_disp)}")
@@ -259,42 +272,70 @@ for ri,name in enumerate(names,1):
         corners=[(x/s,y/s) for x,y in corners_disp]
         plate=crop_pooling_band(rectify(img,np.float32(corners))); pshow,ps=display_fit(plate)
 
-        need=2+int(n)
-        labels=["Dirty control","Clean control"]+[f"Product {chr(65+i)}" for i in range(int(n))]
-        st.markdown(f"**B. Controls + {int(n)} product guides** — define each area below. For every area, click **two opposite corners** of the rectangle.")
-        rect_state=f"rects_{name}"
+        labels=["Dirty control", "Clean control"]
+        st.markdown("**B. Reference areas** — select two opposite corners of the dirty control and then of the clean control.")
+        rect_state=f"controls_rects_{name}"
         rects=st.session_state.setdefault(rect_state,[])
         current=len(rects)
-        if current<need:
-            st.info(f"Now select: **{labels[current]}** ({current+1}/{need})")
-            pair_state=f"rect_pair_{name}_{current}"
+        if current<2:
+            st.info(f"Now select **{labels[current]}** ({current+1}/2)")
+            pair_state=f"control_pair_{name}_{current}"
             pair=st.session_state.setdefault(pair_state,[])
-            pair_widget=f"rect_click_{name}_{current}"
-            prev=st.session_state.get(pair_widget)
-            prev_sig=_click_signature(prev) if isinstance(prev,dict) else None
-            last_key=pair_state+"_last"
-            if prev_sig and prev_sig != st.session_state.get(last_key) and len(pair)<2:
-                st.session_state[last_key]=prev_sig
-                pair.append((float(prev["x"]),float(prev["y"])))
-            rect_vis=draw_rects(pshow,rects,labels,scale=ps)
-            rect_vis=draw_points(rect_vis,pair,["1","2"])
-            pair=collect_click(pil_bgr(rect_vis),pair_widget,pair_state,max_points=2)
+            pair_widget=f"control_click_{name}_{current}"
+            previous=st.session_state.get(pair_widget)
+            signature=_click_signature(previous) if isinstance(previous,dict) else None
+            marker_key=pair_state+"_last"
+            if signature and signature!=st.session_state.get(marker_key) and len(pair)<2:
+                st.session_state[marker_key]=signature
+                pair.append((float(previous['x']),float(previous['y'])))
+            vis=draw_rects(pshow,rects,labels,scale=ps)
+            vis=draw_points(vis,pair,["1","2"])
+            pair=collect_click(pil_bgr(vis),pair_widget,pair_state,max_points=2)
             if len(pair)==2:
                 rr=rect_from_two_points((pair[0][0]/ps,pair[0][1]/ps),(pair[1][0]/ps,pair[1][1]/ps))
                 rects.append(rr)
-                st.session_state.pop(pair_state,None); st.session_state.pop(pair_state+"_last",None); st.rerun()
-        else:
-            st.image(pil_bgr(draw_rects(pshow,rects,labels,scale=ps)),caption="Selected controls and product guides",use_container_width=True)
-        r1,r2=st.columns([1,3])
-        if r1.button("Undo last area",key=f"undo_rect_{name}",disabled=not rects):
-            rects.pop(); st.rerun()
-        r2.caption(f"Areas: {len(rects)} / {need}")
-        if len(rects)==need:
-            if st.button(f"Save setup for replicate {ri}",key=f"save_{name}",type="primary"):
-                st.session_state.exp['configured'][name]={'corners':corners,'dirty':rects[0],'clean':rects[1],'guides':rects[2:]}
-                for i in range(int(n)): st.session_state.exp['accepted'].pop((name,i),None)
-                st.session_state['footprints_confirmed']=False
+                st.session_state.pop(pair_state,None)
+                st.session_state.pop(marker_key,None)
                 st.rerun()
+        else:
+            st.image(pil_bgr(draw_rects(pshow,rects,labels,scale=ps)),caption="Selected reference areas",use_container_width=True)
+        r1,r2=st.columns([1,3])
+        if r1.button("Undo last reference",key=f"undo_ctrl_{name}",disabled=not rects):
+            rects.pop(); st.rerun()
+        r2.caption(f"Reference areas: {len(rects)} / 2")
+
+        if len(rects)==2:
+            st.markdown(f"**C. Product top points** — click the rounded top of each product track, from left to right (Product A → Product {chr(64+int(n))}). Only one point per track is needed.")
+            tip_state=f"tip_points_{name}"
+            tips_display=st.session_state.setdefault(tip_state,[])
+            tip_widget=f"tip_click_{name}"
+            previous=st.session_state.get(tip_widget)
+            signature=_click_signature(previous) if isinstance(previous,dict) else None
+            marker_key=tip_state+"_last"
+            if signature and signature!=st.session_state.get(marker_key) and len(tips_display)<int(n):
+                st.session_state[marker_key]=signature
+                tips_display.append((float(previous['x']),float(previous['y'])))
+            overlay=draw_rects(pshow,rects,labels,scale=ps)
+            tip_labels=[f"{chr(65+i)}" for i in range(int(n))]
+            overlay=draw_points(overlay,tips_display,tip_labels)
+            tips_display=collect_click(pil_bgr(overlay),tip_widget,tip_state,max_points=int(n))
+            t1,t2=st.columns([1,3])
+            if t1.button("Undo last top point",key=f"undo_tip_{name}",disabled=not tips_display):
+                tips_display.pop(); st.rerun()
+            t2.caption(f"Product top points: {len(tips_display)} / {int(n)}")
+            if len(tips_display)==int(n):
+                tips=[(px/ps,py/ps) for px,py in tips_display]
+                if not all(tips[i][0]<tips[i+1][0] for i in range(len(tips)-1)):
+                    st.error("Product top points must be selected from left to right. Undo and correct the last point.")
+                elif st.button(f"Save setup for replicate {ri}",key=f"save_{name}",type="primary"):
+                    guides=lane_guides(tips,plate.shape,plate_bgr=plate)
+                    st.session_state.exp['configured'][name]={
+                        'corners':corners,'dirty':rects[0],'clean':rects[1],
+                        'guides':guides,'tips':tips
+                    }
+                    for i in range(int(n)):st.session_state.exp['accepted'].pop((name,i),None)
+                    st.session_state['footprints_confirmed']=False
+                    st.rerun()
 
 if len(st.session_state.exp['configured'])<len(names):
     st.info("Finish and save the setup for every replicate to continue.")
@@ -309,7 +350,7 @@ for ri,name in enumerate(names,1):
     st.subheader(f"Replicate {ri}")
     cols=st.columns(2)
     for i,r in enumerate(st.session_state.exp['configured'][name]['guides']):
-        pname=f"Product {chr(65+i)}"; key=(name,i); proposal=propose_footprint(frac,tuple(r),plate_bgr=plate); proposals[key]=proposal
+        pname=f"Product {chr(65+i)}"; key=(name,i); proposal=propose_footprint(frac,tuple(r),plate_bgr=plate,tip_xy=st.session_state.exp['configured'][name]['tips'][i]); proposals[key]=proposal
         with cols[i%2]:
             st.markdown(f"**{pname}**")
             if key in st.session_state.exp['accepted']:
@@ -341,7 +382,7 @@ for ri,name in enumerate(names,1):
                     poly_pts=collect_click(pil_bgr(pvis),poly_widget,poly_state)
                     pc1,pc2=st.columns(2)
                     if pc1.button("Undo point",key=f'undopoly_{ri}_{i}',disabled=not poly_pts):
-                        poly_pts.pop(); st.session_state.pop(poly_state+"_last",None); st.rerun()
+                        poly_pts.pop(); st.rerun()
                     if pc2.button("Clear points",key=f'clearpoly_{ri}_{i}',disabled=not poly_pts):
                         st.session_state[poly_state]=[]; st.session_state.pop(poly_state+"_last",None); st.rerun()
                     mm=polygon_mask(plate.shape,[(x/ps,y/ps) for x,y in poly_pts])
