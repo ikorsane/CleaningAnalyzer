@@ -297,34 +297,75 @@ for ri,name in enumerate(names,1):
                 st.session_state.pop(pair_state,None)
                 st.session_state.pop(marker_key,None)
                 st.rerun()
-        else:
-            st.image(pil_bgr(draw_rects(pshow,rects,labels,scale=ps)),caption="Selected reference areas",use_container_width=True)
+        # Once the two controls are selected, draw them on the larger interactive
+        # top-point image below instead of duplicating the entire plate here.
         r1,r2=st.columns([1,3])
         if r1.button("Undo last reference",key=f"undo_ctrl_{name}",disabled=not rects):
             rects.pop(); st.rerun()
         r2.caption(f"Reference areas: {len(rects)} / 2")
 
         if len(rects)==2:
-            st.markdown(f"**C. Product top points** — click the rounded top of each product track, from left to right (Product A → Product {chr(64+int(n))}). Only one point per track is needed.")
             tip_state=f"tip_points_{name}"
             tips_display=st.session_state.setdefault(tip_state,[])
-            tip_widget=f"tip_click_{name}"
-            previous=st.session_state.get(tip_widget)
-            signature=_click_signature(previous) if isinstance(previous,dict) else None
-            marker_key=tip_state+"_last"
-            if signature and signature!=st.session_state.get(marker_key) and len(tips_display)<int(n):
-                st.session_state[marker_key]=signature
-                tips_display.append((float(previous['x']),float(previous['y'])))
-            overlay=draw_rects(pshow,rects,labels,scale=ps)
-            tip_labels=[f"{chr(65+i)}" for i in range(int(n))]
+
+            # The rectified plate can be much narrower than the available viewport.
+            # Enlarge it for the top-point selector; click coordinates remain in this
+            # displayed image and are converted back to native coordinates when saved.
+            tip_scale=650.0/plate.shape[1]
+            if tip_scale>1.0:
+                tip_shown=cv2.resize(plate,(650, max(1,int(round(plate.shape[0]*tip_scale)))),interpolation=cv2.INTER_CUBIC)
+            else:
+                tip_shown,tip_scale=display_fit(plate,maxw=650)
+            tip_scale=tip_shown.shape[1]/plate.shape[1]
+
+            # Migration for points already clicked under the old (smaller) UI. In
+            # that version the display scale was ps, and points were stored in
+            # display pixels. Convert once if this session survived redeployment.
+            scale_key=f"tip_coordinate_scale_{name}"
+            previous_scale=st.session_state.get(scale_key,ps)
+            if tips_display and abs(previous_scale-tip_scale)>1e-8:
+                tips_display[:]=[(float(px)*tip_scale/previous_scale,
+                                 float(py)*tip_scale/previous_scale)
+                                for px,py in tips_display]
+            st.session_state[scale_key]=tip_scale
+
+            if len(tips_display)<int(n):
+                current_product=chr(65+len(tips_display))
+                st.markdown(f"**C. Product top points** — click the rounded top of **Product {current_product}**. Just one click per product, left to right.")
+            else:
+                st.markdown("**C. Product top points** — all product tops are selected.")
+
+            overlay=draw_rects(tip_shown,rects,labels,scale=tip_scale)
+            tip_labels=[chr(65+i) for i in range(int(n))]
             overlay=draw_points(overlay,tips_display,tip_labels)
-            tips_display=collect_click(pil_bgr(overlay),tip_widget,tip_state,max_points=int(n))
+
+            if len(tips_display)<int(n):
+                # A fresh component key at each point prevents an old click from
+                # being replayed when the annotated image changes on rerun.
+                epoch=st.session_state.setdefault(f"top_point_epoch_{name}",0)
+                widget_key=f"top_click_{name}_{epoch}_{len(tips_display)}"
+                click=streamlit_image_coordinates(
+                    pil_bgr(overlay),key=widget_key,
+                    width=tip_shown.shape[1],cursor="crosshair"
+                )
+                if isinstance(click,dict) and 'x' in click and 'y' in click:
+                    px,py=float(click['x']),float(click['y'])
+                    if 0<=px<tip_shown.shape[1] and 0<=py<tip_shown.shape[0]:
+                        tips_display.append((px,py))
+                        # Rendering a fresh component avoids the old image-disappearing
+                        # problem caused by rerunning a component with the same key.
+                        st.rerun()
+            else:
+                st.image(pil_bgr(overlay),width=tip_shown.shape[1])
+
             t1,t2=st.columns([1,3])
             if t1.button("Undo last top point",key=f"undo_tip_{name}",disabled=not tips_display):
-                tips_display.pop(); st.rerun()
+                tips_display.pop()
+                st.session_state[f"top_point_epoch_{name}"]=st.session_state.get(f"top_point_epoch_{name}",0)+1
+                st.rerun()
             t2.caption(f"Product top points: {len(tips_display)} / {int(n)}")
             if len(tips_display)==int(n):
-                tips=[(px/ps,py/ps) for px,py in tips_display]
+                tips=[(px/tip_scale,py/tip_scale) for px,py in tips_display]
                 if not all(tips[i][0]<tips[i+1][0] for i in range(len(tips)-1)):
                     st.error("Product top points must be selected from left to right. Undo and correct the last point.")
                 elif st.button(f"Save setup for replicate {ri}",key=f"save_{name}",type="primary"):
