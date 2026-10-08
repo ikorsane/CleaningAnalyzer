@@ -86,49 +86,72 @@ def originally_soiled_mask(dirty_model, clean_lab, clean_distance_fraction=0.45)
 # ------------------------- footprint proposal -------------------------
 
 def regularize_tongue(mask, guide):
+    """Smooth a detected track into a rounded tongue without large side notches.
+
+    The rounded tip is estimated from the detected footprint, while the lower
+    portion permits mild tapering. All geometry stays in the guide corridor.
     """
-    Preserve a rounded/irregular detected top. In the lower part, once a stable
-    footprint width is established, carry that width vertically to plate bottom.
-    """
-    h,w=mask.shape
-    ys,xs=np.where(mask>0)
-    if len(xs)==0: return mask
-    y0,y1=ys.min(),ys.max()
-    out=np.zeros_like(mask)
+    H, W = mask.shape
+    x, y, gw, gh = map(int, guide)
+    yy, xx = np.where(mask > 0)
+    if not len(xx):
+        return mask
 
-    # Row envelopes, tolerant of ragged/partial cleaning.
-    rows=[]
-    for y in range(y0,y1+1):
-        xx=np.where(mask[y]>0)[0]
-        if len(xx)>=3:
-            rows.append((y,np.percentile(xx,5),np.percentile(xx,95)))
-    if not rows: return mask
-    arr=np.array(rows,float)
-    # Smooth side envelopes.
-    L=cv2.GaussianBlur(arr[:,1].astype(np.float32).reshape(-1,1),(1,0),sigmaX=0,sigmaY=8).ravel()
-    R=cv2.GaussianBlur(arr[:,2].astype(np.float32).reshape(-1,1),(1,0),sigmaX=0,sigmaY=8).ravel()
-    yy=arr[:,0].astype(int)
-    for y,l,r in zip(yy,L,R):
-        out[y,max(0,int(l)):min(w,int(r)+1)]=255
+    top = int(yy.min())
+    # Estimate the footprint's stable sides from row-wise envelopes.
+    left = np.full(H, np.nan)
+    right = np.full(H, np.nan)
+    for row in range(top, H):
+        cols = np.flatnonzero(mask[row] > 0)
+        if len(cols) >= 3:
+            left[row] = np.percentile(cols, 3)
+            right[row] = np.percentile(cols, 97)
+    valid = np.flatnonzero(np.isfinite(left))
+    if len(valid) < 5:
+        return mask
+    rows = np.arange(top, H)
+    left_vals = np.interp(rows, valid, left[valid])
+    right_vals = np.interp(rows, valid, right[valid])
+    sigma = max(3.0, min(14.0, gh * 0.025))
+    def smooth(values):
+        return cv2.GaussianBlur(values.astype(np.float32)[:, None],
+                                (1, 0), sigmaX=0, sigmaY=sigma).ravel()
+    left_vals, right_vals = smooth(left_vals), smooth(right_vals)
+    centers = (left_vals + right_vals) / 2
+    widths = np.maximum(1, right_vals - left_vals)
 
-    # Carry established lower width to bottom.
-    tail_start=int(y0+0.62*(y1-y0))
-    band=(yy>=tail_start)
-    if np.any(band):
-        l=int(np.median(L[band])); r=int(np.median(R[band]))
-        # Avoid narrowing: include existing envelope too.
-        for y in range(tail_start,h):
-            xx=np.where(out[y]>0)[0]
-            if len(xx):
-                l2=min(l,xx.min()); r2=max(r,xx.max())
-            else:
-                l2,r2=l,r
-            out[y,max(0,l2):min(w,r2+1)]=255
+    # Use the first substantial band below the tip for a reliable body width.
+    body_start = min(len(rows)-1, max(1, int(0.16 * gh)))
+    body_end = min(len(rows), max(body_start+1, int(0.50 * gh)))
+    body_width = float(np.percentile(widths[body_start:body_end], 65))
+    body_width = max(6.0, body_width)
 
-    # Close modest gaps but retain overall footprint shape.
-    k=max(5,int(0.012*w)); k += 1-k%2
-    out=cv2.morphologyEx(out,cv2.MORPH_CLOSE,
-                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(k,k)),iterations=1)
+    # Suppress inward notches: each row below the rounded cap retains at
+    # least 82% of the established body width; small bottom taper is allowed.
+    widths = np.maximum(widths, 0.82 * body_width)
+    # Round the cap with a half-ellipse: broad shoulders, no pointed triangle.
+    cap_height = max(6, min(int(0.18 * gh), int(0.38 * body_width)))
+    cap_height = min(cap_height, len(rows))
+    cap_width = float(np.median(widths[min(cap_height, len(rows)-1):
+                                       min(len(rows), cap_height + max(3, int(0.1*gh)))]))
+    cap_width = max(cap_width, 0.82 * body_width)
+    for i in range(cap_height):
+        t = (i + 0.5) / cap_height
+        rounded = cap_width * np.sqrt(max(0.0, 1.0 - (1.0-t)**2))
+        widths[i] = rounded
+    widths = smooth(widths)
+
+    # Prevent strong lateral jumps without shifting the entire footprint.
+    centers = smooth(centers)
+    corridor_l = max(0, int(x - 0.10*gw))
+    corridor_r = min(W, int(x + 1.10*gw))
+    out = np.zeros_like(mask)
+    for i, row in enumerate(rows):
+        half = widths[i] / 2
+        l = max(corridor_l, int(round(centers[i] - half)))
+        r = min(corridor_r, int(round(centers[i] + half)) + 1)
+        if r > l:
+            out[row, l:r] = 255
     return out
 
 def propose_footprint(clean_frac, guide_roi):
