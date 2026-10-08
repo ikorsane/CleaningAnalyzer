@@ -11,6 +11,7 @@ from analysis_backend import (
     rectify, lab_float, roi_mask, robust_lab, spatial_dirty_model,
     cleaning_fraction, originally_soiled_mask, propose_footprint,
     bottom_exclusion_mask, metrics, heatmap_overlay, save_report_workbook,
+    FOOTPRINT_ALGORITHM_VERSION,
 )
 
 st.set_page_config(page_title="Cleaning Analyzer", page_icon="🧪", layout="wide")
@@ -26,6 +27,13 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 if 'exp' not in st.session_state:
     st.session_state.exp={'n_products':4,'files':{},'results':[],'configured':{},'accepted':{}}
+# A new boundary algorithm invalidates previously cached automatic proposals.
+# Retain uploads and ROI selections so nobody has to mark plate corners again.
+if st.session_state.get('footprint_algorithm_version') != FOOTPRINT_ALGORITHM_VERSION:
+    st.session_state.exp['accepted'] = {}
+    st.session_state['footprints_confirmed'] = False
+    st.session_state['footprint_algorithm_version'] = FOOTPRINT_ALGORITHM_VERSION
+
 
 def decode(upload):
     b=np.frombuffer(upload.getvalue(),np.uint8)
@@ -301,7 +309,7 @@ for ri,name in enumerate(names,1):
     st.subheader(f"Replicate {ri}")
     cols=st.columns(2)
     for i,r in enumerate(st.session_state.exp['configured'][name]['guides']):
-        pname=f"Product {chr(65+i)}"; key=(name,i); proposal=propose_footprint(frac,tuple(r)); proposals[key]=proposal
+        pname=f"Product {chr(65+i)}"; key=(name,i); proposal=propose_footprint(frac,tuple(r),plate_bgr=plate); proposals[key]=proposal
         with cols[i%2]:
             st.markdown(f"**{pname}**")
             if key in st.session_state.exp['accepted']:
