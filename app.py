@@ -202,7 +202,12 @@ def build_outputs():
             heatmap_mask=cv2.bitwise_and(accepted_clipped,valid)
             accepted_masks.append(heatmap_mask)
 
-            pname=f"Product {chr(65+i)}"; row=metrics(pname,frac,am); row['Replicate']=ri; rows.append(row)
+            # Keep true contact/wetting area separate from the originally-soiled
+            # pixels that are eligible for quantitative cleaning analysis.
+            pname=f"Product {chr(65+i)}"
+            row=metrics(pname,frac,am,contact_mask=accepted_clipped,
+                        plate_area_px=plate.shape[0]*plate.shape[1])
+            row['Replicate']=ri; rows.append(row)
             stem=pname.replace(' ','_')
             files[f'{prefix}/{stem}_contact_mask.png']=png_bytes(accepted_clipped)
             files[f'{prefix}/{stem}_analysis_mask.png']=png_bytes(am)
@@ -444,11 +449,42 @@ if not st.session_state.get('footprints_confirmed',False):
 
 st.markdown('<div class="step">STEP 4 · RESULTS</div>',unsafe_allow_html=True)
 df,xlsx,zipbytes=build_outputs()
-summary=df.groupby('Product',sort=False).agg(n=('Replicate','count'),mean_cleaning=('Mean cleaning depth (%)','mean'),sd_cleaning=('Mean cleaning depth (%)','std'),coverage50=('Footprint >=50% cleaned (%)','mean'),coverage75=('Footprint >=75% cleaned (%)','mean'),footprint=('Footprint area (px)','mean')).reset_index()
-summary['Rank']=summary['mean_cleaning'].rank(ascending=False,method='min').astype(int)
+summary=df.groupby('Product',sort=False).agg(
+    n=('Replicate','count'),
+    mean_cleaning=('Mean cleaning depth (%)','mean'),
+    sd_cleaning=('Mean cleaning depth (%)','std'),
+    contact=('Contact area (% plate)','mean'),
+    sd_contact=('Contact area (% plate)','std'),
+    total_removal=('Integrated optical removal (% plate)','mean'),
+    sd_total_removal=('Integrated optical removal (% plate)','std'),
+    footprint=('Footprint area (px)','mean'),
+    coverage50=('Footprint >=50% cleaned (%)','mean'),
+    coverage75=('Footprint >=75% cleaned (%)','mean'),
+).reset_index()
+summary['Rank (mean cleaning)']=summary['mean_cleaning'].rank(ascending=False,method='min').astype('Int64')
+summary['Rank (total removal)']=summary['total_removal'].rank(ascending=False,method='min').astype('Int64')
 
 st.subheader("Cleaning performance across replicate plates")
-st.dataframe(summary.rename(columns={'mean_cleaning':'Mean cleaning (%)','sd_cleaning':'SD (%)','coverage50':'Area ≥50% cleaned (%)','coverage75':'Area ≥75% cleaned (%)','footprint':'Mean footprint area (px)'}),hide_index=True,use_container_width=True,column_config={'Mean cleaning (%)':st.column_config.NumberColumn(format='%.1f'),'SD (%)':st.column_config.NumberColumn(format='%.1f'),'Area ≥50% cleaned (%)':st.column_config.NumberColumn(format='%.1f'),'Area ≥75% cleaned (%)':st.column_config.NumberColumn(format='%.1f'),'Mean footprint area (px)':st.column_config.NumberColumn(format='%.0f')})
+display_summary=summary.rename(columns={
+    'mean_cleaning':'Mean cleaning (%)','sd_cleaning':'Cleaning SD',
+    'contact':'Contact area (% plate)','sd_contact':'Contact area SD',
+    'total_removal':'Total optical removal (% plate)','sd_total_removal':'Total removal SD',
+    'footprint':'Mean contact area (px)',
+    'coverage50':'Area ≥50% cleaned (%)','coverage75':'Area ≥75% cleaned (%)',
+})
+st.dataframe(
+    display_summary,hide_index=True,use_container_width=True,
+    column_config={
+        **{label:st.column_config.NumberColumn(format='%.2f') for label in [
+            'Mean cleaning (%)','Cleaning SD','Contact area (% plate)','Contact area SD',
+            'Total optical removal (% plate)','Total removal SD',
+            'Area ≥50% cleaned (%)','Area ≥75% cleaned (%)']},
+        'Mean contact area (px)':st.column_config.NumberColumn(format='%.0f'),
+    },
+)
+st.caption("Mean cleaning describes cleaning intensity within the originally soiled part of the footprint. "
+           "Contact area describes spreading. Total optical removal combines cleaning intensity "
+           "and the analyzed area, expressed as equivalent clean area relative to the rectified plate.")
 
 fig,ax=plt.subplots(figsize=(9,4.8))
 x=np.arange(len(summary))
@@ -460,14 +496,57 @@ ax.set_ylabel('Cleaning (%)')
 ax.set_ylim(0,100)
 ax.set_xticks(x)
 ax.set_xticklabels(labels)
-ax.set_title('Mean cleaning performance ± SD')
+ax.set_title('Mean cleaning intensity ± SD')
 ax.spines[['top','right']].set_visible(False)
 ax.grid(axis='y',alpha=.2)
 ax.set_axisbelow(True)
 fig.tight_layout()
 st.pyplot(fig,use_container_width=True)
 plt.close(fig)
+
+# Unlike mean cleaning, this score rewards spreading over a larger soiled area.
+# Expressing the integral as a percentage of plate area makes it comparable when
+# replicate photographs have different pixel dimensions.
+st.subheader('Total optical removal — cleaning intensity × area')
+fig_total,ax_total=plt.subplots(figsize=(9,4.8))
+integrated=summary['total_removal'].to_numpy(dtype=float)
+integrated_sd=summary['sd_total_removal'].fillna(0).to_numpy(dtype=float)
+ax_total.bar(x,integrated,yerr=integrated_sd,capsize=6)
+ax_total.set_ylabel('Equivalent cleaned area (% of plate)')
+ax_total.set_ylim(bottom=0)
+ax_total.set_xticks(x)
+ax_total.set_xticklabels(labels)
+ax_total.set_title('Integrated optical removal ± SD')
+ax_total.spines[['top','right']].set_visible(False)
+ax_total.grid(axis='y',alpha=.2)
+ax_total.set_axisbelow(True)
+fig_total.tight_layout()
+st.pyplot(fig_total,use_container_width=True)
+plt.close(fig_total)
+st.caption('Each pixel contributes its estimated cleaning fraction (0–1). The sum is ' 
+           'divided by the total cropped plate pixels. For example, a footprint covering ' 
+           '20% of the plate at 50% mean cleaning of originally soiled pixels contributes ' 
+           'approximately 10% equivalent clean area when the whole footprint was originally soiled. ' 
+           'This is an optical proxy, **not** a measurement of soil mass.')
+
+st.subheader('Product spreading')
+fig_contact,ax_contact=plt.subplots(figsize=(9,4.2))
+ax_contact.bar(x,summary['contact'].to_numpy(dtype=float),
+               yerr=summary['sd_contact'].fillna(0).to_numpy(dtype=float),capsize=6)
+ax_contact.set_ylabel('Contacted area (% of plate)')
+ax_contact.set_ylim(bottom=0)
+ax_contact.set_xticks(x)
+ax_contact.set_xticklabels(labels)
+ax_contact.set_title('Contact area ± SD')
+ax_contact.spines[['top','right']].set_visible(False)
+ax_contact.grid(axis='y',alpha=.2)
+ax_contact.set_axisbelow(True)
+fig_contact.tight_layout()
+st.pyplot(fig_contact,use_container_width=True)
+plt.close(fig_contact)
+
 coverage=summary.set_index('Product')[['coverage50','coverage75']].rename(columns={'coverage50':'≥50% cleaned','coverage75':'≥75% cleaned'})
+st.markdown('**Cleaning coverage within the originally soiled footprint**')
 st.bar_chart(coverage,y_label='Footprint meeting threshold (%)',height=360)
 
 
@@ -509,4 +588,8 @@ for ri,name in enumerate(names,1):
 c1,c2=st.columns(2)
 c1.download_button("Download Excel report",xlsx,file_name='Cleaning_Analyzer_results.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
 c2.download_button("Download complete analysis ZIP",zipbytes,file_name='Cleaning_Analyzer_analysis.zip',mime='application/zip',use_container_width=True)
-st.caption("Across-plate values are arithmetic means with each replicate weighted equally. SD is the sample standard deviation between replicate plates; with n=1, SD is not reported. Footprint area is a contact/wetting diagnostic, not cleaning efficacy by itself.")
+st.caption("Across-plate values are arithmetic means with each replicate weighted equally. "
+           "SD is the sample standard deviation between replicate plates; with n=1, SD is not reported. "
+           "Percent-of-plate measurements assume the photographs show equivalent physical plate regions "
+           "after perspective correction and the fixed bottom 5% crop. Full contact area includes pixels "
+           "that were not originally soiled; total removal only sums pixels assessed as originally soiled.")

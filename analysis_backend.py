@@ -529,19 +529,35 @@ def bottom_exclusion_mask(shape, frac=BOTTOM_MARGIN_FRAC):
     m[cut:, :] = 0
     return m
 
-def metrics(name, frac, mask):
-    vals=frac[mask>0]
+def metrics(name, frac, mask, contact_mask=None, plate_area_px=None):
+    """Separate cleaning depth, wetting area and integrated optical removal.
+
+    `mask` contains originally-soiled pixels within the footprint, whereas
+    `contact_mask` is the full footprint, independent of its cleaning result.
+    The normalized integral permits comparison of different image resolutions
+    of the same physical plate (with consistent plate cropping).
+    """
+    vals=np.clip(np.nan_to_num(frac[mask>0], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
     area=int(np.count_nonzero(mask))
+    contact_area=int(np.count_nonzero(contact_mask)) if contact_mask is not None else area
+    plate_area=int(plate_area_px) if plate_area_px is not None else int(frac.size)
+    if plate_area<=0:
+        raise ValueError("Plate area must be positive")
+    depth=lambda f: (float(f(vals))*100.0 if vals.size else float('nan'))
+    integral=float(np.sum(vals))
     return {
         "Product":name,
-        "Footprint area (px)":area,
-        "Mean cleaning depth (%)":100*float(np.mean(vals)),
-        "Median cleaning depth (%)":100*float(np.median(vals)),
-        "25th percentile cleaning (%)":100*float(np.percentile(vals,25)),
-        "75th percentile cleaning (%)":100*float(np.percentile(vals,75)),
-        "Footprint >=50% cleaned (%)":100*float(np.mean(vals>=.50)),
-        "Footprint >=75% cleaned (%)":100*float(np.mean(vals>=.75)),
-        "Integrated optical removal (equiv clean px)":float(np.sum(vals)),
+        "Footprint area (px)":contact_area,
+        "Contact area (% plate)":100.0*contact_area/plate_area,
+        "Analyzed originally soiled area (px)":area,
+        "Mean cleaning depth (%)":depth(np.mean),
+        "Median cleaning depth (%)":depth(np.median),
+        "25th percentile cleaning (%)":depth(lambda a:np.percentile(a,25)),
+        "75th percentile cleaning (%)":depth(lambda a:np.percentile(a,75)),
+        "Footprint >=50% cleaned (%)":depth(lambda a:np.mean(a>=.50)),
+        "Footprint >=75% cleaned (%)":depth(lambda a:np.mean(a>=.75)),
+        "Integrated optical removal (equiv clean px)":integral,
+        "Integrated optical removal (% plate)":100.0*integral/plate_area,
     }
 
 
@@ -555,10 +571,13 @@ def save_report_workbook(df, outpath):
     from openpyxl.utils import get_column_letter
 
     metric_map = {
-        "Cleaning performance (%)": "Mean cleaning depth (%)",
+        "Mean cleaning (%)": "Mean cleaning depth (%)",
+        "Contact area (% plate)": "Contact area (% plate)",
+        "Total optical removal (% plate)": "Integrated optical removal (% plate)",
+        "Contact area (px)": "Footprint area (px)",
+        "Analyzed originally soiled area (px)": "Analyzed originally soiled area (px)",
         "Area >=50% cleaned (%)": "Footprint >=50% cleaned (%)",
         "Area >=75% cleaned (%)": "Footprint >=75% cleaned (%)",
-        "Footprint area (px)": "Footprint area (px)",
     }
     g=df.groupby("Product", sort=False)
     rows=[]
@@ -569,36 +588,67 @@ def save_report_workbook(df, outpath):
             row[label+" SD"]=sub[col].std(ddof=1) if len(sub)>1 else np.nan
         rows.append(row)
     summary=pd.DataFrame(rows)
-    summary["Rank"]=summary["Cleaning performance (%)"].rank(ascending=False,method="min").astype(int)
+    summary["Rank (mean cleaning)"]=summary["Mean cleaning (%)"].rank(ascending=False,method="min")
+    summary["Rank (total removal)"]=summary["Total optical removal (% plate)"].rank(ascending=False,method="min")
 
     wb=Workbook(); ws=wb.active; ws.title="Summary"
     rep=wb.create_sheet("Replicate Results"); detail=wb.create_sheet("Detailed Results")
     navy="17365D"; blue="4472C4"; pale="D9EAF7"; white="FFFFFF"; thin=Side(style="thin",color="D9D9D9")
 
     ws["A1"]="Cleaning Performance Summary"; ws["A1"].font=Font(bold=True,size=18,color=navy)
-    ws.merge_cells("A1:K1")
+    ws.merge_cells("A1:R1")
     ws["A2"]="Mean ± SD across independent plate/image replicates. Each replicate is weighted equally."; ws["A2"].font=Font(size=10,color="666666")
-    ws.merge_cells("A2:K2")
-    cols=["Product","n","Cleaning performance (%)","Cleaning performance (%) SD","Area >=50% cleaned (%)","Area >=50% cleaned (%) SD","Area >=75% cleaned (%)","Area >=75% cleaned (%) SD","Footprint area (px)","Footprint area (px) SD","Rank"]
-    ws["A4"]="Comparative results"; ws["A4"].font=Font(bold=True,color=white); ws["A4"].fill=PatternFill("solid",fgColor=navy); ws.merge_cells("A4:K4")
+    ws.merge_cells("A2:R2")
+    cols=["Product","n",
+          "Mean cleaning (%)","Mean cleaning (%) SD",
+          "Contact area (% plate)","Contact area (% plate) SD",
+          "Total optical removal (% plate)","Total optical removal (% plate) SD",
+          "Contact area (px)","Contact area (px) SD",
+          "Analyzed originally soiled area (px)","Analyzed originally soiled area (px) SD",
+          "Area >=50% cleaned (%)","Area >=50% cleaned (%) SD",
+          "Area >=75% cleaned (%)","Area >=75% cleaned (%) SD",
+          "Rank (mean cleaning)","Rank (total removal)"]
+    ws["A4"]="Comparative results"; ws["A4"].font=Font(bold=True,color=white); ws["A4"].fill=PatternFill("solid",fgColor=navy); ws.merge_cells("A4:R4")
     for c,col in enumerate(cols,1):
         cell=ws.cell(5,c,col); cell.font=Font(bold=True,color=white); cell.fill=PatternFill("solid",fgColor=blue); cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True); cell.border=Border(left=thin,right=thin,top=thin,bottom=thin)
     for r,row in enumerate(summary[cols].itertuples(index=False,name=None),6):
         for c,val in enumerate(row,1):
             if pd.isna(val): val=None
             cell=ws.cell(r,c,val.item() if hasattr(val,"item") else val); cell.border=Border(left=thin,right=thin,top=thin,bottom=thin); cell.alignment=Alignment(horizontal="left" if c==1 else "center")
-            if c in (3,4,5,6,7,8): cell.number_format="0.0"
-            elif c in (2,9,10,11): cell.number_format="0"
+            if c in (2,9,10,11,12,17,18): cell.number_format="0"
+            else: cell.number_format="0.00"
     last=5+len(summary)
-    for col in ("C","E","G"):
+    for col in ("C","E","G","M","O"):
         ws.conditional_formatting.add(f"{col}6:{col}{last}",DataBarRule(start_type="num",start_value=0,end_type="num",end_value=100,color=pale,showValue=True))
 
-    # Clean report-style charts. SD is shown numerically in the adjacent summary columns.
-    ch=BarChart(); ch.type="col"; ch.style=10; ch.title="Mean cleaning performance"; ch.y_axis.title="Cleaning (%)"; ch.y_axis.scaling.min=0; ch.y_axis.scaling.max=100; ch.height=8; ch.width=14; ch.add_data(Reference(ws,min_col=3,min_row=5,max_row=last),titles_from_data=True); ch.set_categories(Reference(ws,min_col=1,min_row=6,max_row=last)); ch.legend=None; ch.dLbls=DataLabelList(); ch.dLbls.showVal=True; ws.add_chart(ch,"M2")
-    ch2=BarChart(); ch2.type="col"; ch2.style=10; ch2.title="Cleaning coverage"; ch2.y_axis.title="Footprint meeting threshold (%)"; ch2.y_axis.scaling.min=0; ch2.y_axis.scaling.max=100; ch2.height=8; ch2.width=14; ch2.add_data(Reference(ws,min_col=5,max_col=7,min_row=5,max_row=last),titles_from_data=True,from_rows=False); ch2.series=[ch2.series[0],ch2.series[2]] if len(ch2.series)>=3 else ch2.series; ch2.set_categories(Reference(ws,min_col=1,min_row=6,max_row=last)); ch2.legend.position="b"; ws.add_chart(ch2,"U2")
-    note=ws.cell(last+3,1); ws.merge_cells(start_row=last+3,start_column=1,end_row=last+6,end_column=11); note.value="Interpretation: values are arithmetic means across replicate plates/images; SD is the sample standard deviation between replicates (n=1: SD not reported). Replicates are weighted equally rather than by footprint pixel count. Footprint area is a diagnostic of contact/wetting and should not by itself be interpreted as cleaning efficacy."; note.font=Font(size=9,color="666666"); note.alignment=Alignment(wrap_text=True,vertical="top")
-    for c,w in {"A":18,"B":8,"C":22,"D":18,"E":22,"F":18,"G":22,"H":18,"I":20,"J":18,"K":9}.items(): ws.column_dimensions[c].width=w
-    ws.row_dimensions[5].height=42; ws.sheet_view.showGridLines=False
+    # In-sheet charts; Streamlit chart displays replicate SD as error bars.
+    def add_single_chart(column, title, ylabel, at, ymax=None):
+        ch=BarChart(); ch.type="col"; ch.style=10
+        ch.title=title; ch.y_axis.title=ylabel; ch.height=8; ch.width=14
+        ch.add_data(Reference(ws,min_col=column,min_row=5,max_row=last),titles_from_data=True)
+        ch.set_categories(Reference(ws,min_col=1,min_row=6,max_row=last))
+        ch.legend=None; ch.dLbls=DataLabelList(); ch.dLbls.showVal=True
+        if ymax is not None: ch.y_axis.scaling.min=0; ch.y_axis.scaling.max=ymax
+        ws.add_chart(ch,at)
+    add_single_chart(3,"Mean cleaning intensity","Mean cleaning (%)","T2",100)
+    add_single_chart(7,"Total optical removal","Equivalent clean area (% plate)","AB2")
+    add_single_chart(5,"Product contact area","Plate area contacted (%)","T19")
+    ch2=BarChart(); ch2.type="col"; ch2.style=10; ch2.title="Cleaning coverage"; ch2.y_axis.title="Footprint meeting threshold (%)"; ch2.y_axis.scaling.min=0; ch2.y_axis.scaling.max=100; ch2.height=8; ch2.width=14
+    ch2.add_data(Reference(ws,min_col=13,min_row=5,max_row=last),titles_from_data=True)
+    ch2.add_data(Reference(ws,min_col=15,min_row=5,max_row=last),titles_from_data=True)
+    ch2.set_categories(Reference(ws,min_col=1,min_row=6,max_row=last)); ch2.legend.position="b"; ws.add_chart(ch2,"AB19")
+    note=ws.cell(last+3,1)
+    ws.merge_cells(start_row=last+3,start_column=1,end_row=last+7,end_column=18)
+    note.value=("Interpretation: Mean cleaning is the mean optical cleaning fraction within originally soiled pixels of the accepted footprint. "
+                "Contact area is the entire accepted footprint. Total optical removal is the sum of cleaning fractions over originally soiled pixels, "
+                "divided by the rectified plate area (after the fixed 5% bottom crop). This is an equivalent cleaned area, not a measured mass of soil. "
+                "Normalization supports comparisons across photo resolutions when plates have the same physical dimensions and framing. "
+                "All replicate plates contribute equally. SD is the sample SD between plates; with n=1, SD is not reported.")
+    note.font=Font(size=9,color="666666"); note.alignment=Alignment(wrap_text=True,vertical="top")
+    for c,w in enumerate([20,8,19,17,20,17,24,20,18,17,24,22,21,19,21,19,18,18],1):
+        ws.column_dimensions[get_column_letter(c)].width=w
+    ws.row_dimensions[5].height=57; ws.sheet_view.showGridLines=False
+    ws.freeze_panes="C6"
 
     # Replicate-level sheet: one row per product per plate.
     repdf=df.copy()
